@@ -1,0 +1,11 @@
+ScanSect Measurement Data
+========================
+
+Timestamp: 2026-01-12 14:07:57
+Model: THESIS_LONGHORN.obj
+Description: Body Length - Longhorn
+
+Measurement:
+  Point 1: (-0.7100, 64.0120, 3.8951)
+  Point 2: (0.6691, 27.8957, -2.5157)
+  Distance: 36.7067 mm

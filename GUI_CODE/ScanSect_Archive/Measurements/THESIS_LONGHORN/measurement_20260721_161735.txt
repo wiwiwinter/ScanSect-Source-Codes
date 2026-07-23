@@ -1,0 +1,11 @@
+ScanSect Measurement Data
+========================
+
+Timestamp: 2026-07-21 16:17:35
+Model: THESIS_LONGHORN.obj
+Description: MANDIBLE - LONGHORN
+
+Measurement:
+  Point 1: (-2.9472, 61.0900, 6.8429)
+  Point 2: (-6.1016, 60.4714, 6.9737)
+  Distance: 3.2171 mm
