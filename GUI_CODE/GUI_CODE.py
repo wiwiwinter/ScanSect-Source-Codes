@@ -15,7 +15,9 @@ v12 changes:
 import sys
 import os
 import json
+import csv
 import uuid
+import shutil
 from datetime import datetime
 
 from PySide6.QtWidgets import (
@@ -47,10 +49,21 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QSplashScreen,
     QGridLayout,
+    QSlider,
+    QCheckBox,
 )
-from PySide6.QtGui import QAction, QKeySequence, QIcon, QMouseEvent, QPixmap, QPainter, QFont, QColor
+from PySide6.QtGui import QAction, QKeySequence, QIcon, QMouseEvent, QPixmap, QPainter, QFont, QColor, QShortcut
 from PySide6.QtCore import Qt, QEvent, QObject, Slot, QByteArray, QSize, QThread, Signal, QTimer
 from PySide6.QtSvg import QSvgRenderer
+from measurement_utils import (
+    distance_raw,
+    distance_mm,
+    polyline_raw,
+    polyline_mm,
+    angle_degrees,
+    unit_multiplier_from_mm,
+    format_distance_from_mm,
+)
 
 # --- Lazy-loaded heavy libraries ---
 pv = None
@@ -101,6 +114,30 @@ def get_icon_from_svg(svg_data_string, size=QSize(16, 16)):
     renderer.render(painter)
     painter.end()
     return QIcon(pixmap)
+
+
+def atomic_write_json_with_backup(file_path, data):
+    """Write JSON atomically and keep a .bak snapshot of the previous file."""
+    directory = os.path.dirname(file_path) or "."
+    os.makedirs(directory, exist_ok=True)
+    temp_path = f"{file_path}.tmp"
+    backup_path = f"{file_path}.bak"
+
+    try:
+        if os.path.exists(file_path):
+            shutil.copy2(file_path, backup_path)
+
+        with open(temp_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+
+        os.replace(temp_path, file_path)
+    except Exception:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+        raise
 
 
 # =====================================================================
@@ -348,12 +385,20 @@ class ArchiveManager:
                     return json.load(f)
             except Exception as e:
                 print(f"Error loading index {index_path}: {e}")
+                backup_path = f"{index_path}.bak"
+                if os.path.exists(backup_path):
+                    try:
+                        with open(backup_path, 'r') as f:
+                            data = json.load(f)
+                        print(f"Recovered archive index from backup: {backup_path}")
+                        return data
+                    except Exception as backup_error:
+                        print(f"Backup recovery failed for {backup_path}: {backup_error}")
         return []
 
     def _save_index(self, index_path, data):
         try:
-            with open(index_path, 'w') as f:
-                json.dump(data, f, indent=2)
+            atomic_write_json_with_backup(index_path, data)
         except Exception as e:
             print(f"Error saving index {index_path}: {e}")
             raise
@@ -425,7 +470,7 @@ class MeasurementDisplayWidget(QFrame):
         self.setObjectName("MeasurementDisplay")
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setAutoFillBackground(True)
-        self.setFixedHeight(100)
+        self.setFixedHeight(122)
         self.hide()
 
         layout = QVBoxLayout(self)
@@ -441,6 +486,9 @@ class MeasurementDisplayWidget(QFrame):
         self._title = QLabel("MEASUREMENT")
         self._title.setObjectName("MeasurementTitle")
         title_row.addWidget(self._title)
+        self._mode_badge = QLabel("DISTANCE")
+        self._mode_badge.setObjectName("MeasurementModeBadge")
+        title_row.addWidget(self._mode_badge)
         title_row.addStretch()
         layout.addLayout(title_row)
 
@@ -454,8 +502,12 @@ class MeasurementDisplayWidget(QFrame):
         self._coords_label.setObjectName("MeasurementCoords")
         layout.addWidget(self._coords_label)
 
-    def update_measurement(self, point1, point2, distance):
-        self._distance_label.setText(f"{distance:.4f} mm")
+        self._step_label = QLabel("")
+        self._step_label.setObjectName("MeasurementStep")
+        layout.addWidget(self._step_label)
+
+    def update_measurement(self, point1, point2, distance_text):
+        self._distance_label.setText(distance_text)
         self._coords_label.setText(
             f"P1: ({point1[0]:.2f}, {point1[1]:.2f}, {point1[2]:.2f})  \u2192  "
             f"P2: ({point2[0]:.2f}, {point2[1]:.2f}, {point2[2]:.2f})"
@@ -463,9 +515,16 @@ class MeasurementDisplayWidget(QFrame):
         if not self.isVisible():
             self.show()
 
+    def update_context(self, mode_text, step_text):
+        self._mode_badge.setText((mode_text or "").upper())
+        self._step_label.setText(step_text or "")
+        if not self.isVisible():
+            self.show()
+
     def clear_display(self):
         self._distance_label.setText("0.00 mm")
         self._coords_label.setText("")
+        self._step_label.setText("")
         self.hide()
 
 
@@ -589,6 +648,7 @@ class MeasurementDetailWidget(QFrame):
             return
 
         dist = data.get('distance', 'N/A')
+        m_type = str(data.get('measurement_type', 'distance')).capitalize()
         desc = data.get('description', 'No description')
         ts = data.get('timestamp', 'Unknown')
         model = data.get('model_name', 'Unknown')
@@ -596,8 +656,10 @@ class MeasurementDetailWidget(QFrame):
 
         p1 = data.get('point1', [0, 0, 0])
         p2 = data.get('point2', [0, 0, 0])
+        p3 = data.get('point3')
 
         self._detail_text.setText(
+            f"<b>Type:</b> {m_type}<br/>"
             f"<b>Distance:</b> <span style='color: #4fc3f7; font-size: 12pt;'>{dist}</span><br/>"
             f"<b>Description:</b> {desc}<br/>"
             f"<b>Model:</b> {model}<br/>"
@@ -605,6 +667,7 @@ class MeasurementDetailWidget(QFrame):
             f"<b>Session ID:</b> <span style='color: #888;'>{sid}</span><br/>"
             f"<b>P1:</b> ({p1[0]:.3f}, {p1[1]:.3f}, {p1[2]:.3f})&nbsp;&nbsp;"
             f"<b>P2:</b> ({p2[0]:.3f}, {p2[1]:.3f}, {p2[2]:.3f})"
+            + (f"<br/><b>P3:</b> ({p3[0]:.3f}, {p3[1]:.3f}, {p3[2]:.3f})" if p3 else "")
         )
 
         if linked_screenshots:
@@ -699,13 +762,22 @@ class ScanSectGUI(QMainWindow):
         self.measurement_text_actor = None
         self.current_measurement = {}
         self._measurement_pick_points = []
-        self._measurement_line_actor = None
+        self._measurement_line_actors = []
         self._measurement_marker_actors = []
+        self.measurement_mode = "Distance"
+        self.session_measurements = []
         self._vertex_picker = None
         self._active_remapped_button = Qt.NoButton
         self._loader_worker = None
         self._save_worker = None
         self._current_session_id = str(uuid.uuid4())[:8]
+        self.measurement_unit = "mm"
+        self.scale_to_mm = 1.0
+        self.render_preset = "Textured"
+        self.clip_enabled = False
+        self.clip_ratio = 0.5
+        self.high_contrast_enabled = False
+        self._thumbnail_cache = {}
 
         # Managers
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -727,9 +799,11 @@ class ScanSectGUI(QMainWindow):
         self._init_side_panel()
         self._init_layout()
         self._init_menus()
+        self._init_shortcuts()
         self._init_interactor()
         self._init_status_bar()
         self._apply_stylesheet()
+        self._run_archive_integrity_check()
 
         # Initial data refresh
         self._refresh_screenshot_list()
@@ -807,13 +881,48 @@ class ScanSectGUI(QMainWindow):
         self.measure_button.setIcon(get_icon_from_svg(SVG_MEASURE_ICON, icon_size))
         self.measure_button.setCheckable(True)
         self.measure_button.clicked.connect(self.toggle_measurement_mode)
+        self.measure_button.setToolTip("Toggle measurement mode (M)")
         tool_layout.addWidget(self.measure_button)
+
+        self.measure_mode_combo = QComboBox()
+        self.measure_mode_combo.addItems(["Distance", "Angle", "Polyline"])
+        self.measure_mode_combo.currentTextChanged.connect(self._on_measurement_mode_changed)
+        self.measure_mode_combo.setToolTip("Measurement mode")
+        tool_layout.addWidget(self.measure_mode_combo)
+
+        self.finish_measure_button = QPushButton(" Finish")
+        self.finish_measure_button.clicked.connect(self._finish_polyline_measurement)
+        self.finish_measure_button.setEnabled(False)
+        self.finish_measure_button.setToolTip("Finish polyline measurement")
+        tool_layout.addWidget(self.finish_measure_button)
 
         self.texture_button = QPushButton(" Load Texture")
         self.texture_button.setIcon(get_icon_from_svg(SVG_TEXTURE_ICON, icon_size))
         self.texture_button.clicked.connect(self.load_texture_dialog)
         self.texture_button.setEnabled(False)
         tool_layout.addWidget(self.texture_button)
+
+        self.render_preset_combo = QComboBox()
+        self.render_preset_combo.addItems(["Textured", "Matte", "Wireframe", "X-Ray"])
+        self.render_preset_combo.currentTextChanged.connect(self._on_render_preset_changed)
+        self.render_preset_combo.setToolTip("Viewport render style")
+        tool_layout.addWidget(self.render_preset_combo)
+
+        self.clip_toggle_button = QPushButton(" Clip")
+        self.clip_toggle_button.setCheckable(True)
+        self.clip_toggle_button.clicked.connect(self._toggle_clip_mode)
+        self.clip_toggle_button.setEnabled(False)
+        self.clip_toggle_button.setToolTip("Toggle Z-axis clipping")
+        tool_layout.addWidget(self.clip_toggle_button)
+
+        self.clip_slider = QSlider(Qt.Horizontal)
+        self.clip_slider.setRange(10, 90)
+        self.clip_slider.setValue(50)
+        self.clip_slider.valueChanged.connect(self._on_clip_slider_changed)
+        self.clip_slider.setEnabled(False)
+        self.clip_slider.setFixedWidth(90)
+        self.clip_slider.setToolTip("Adjust clipping depth")
+        tool_layout.addWidget(self.clip_slider)
 
         tool_layout.addWidget(self._make_separator())
 
@@ -824,12 +933,14 @@ class ScanSectGUI(QMainWindow):
         self.screenshot_button = QPushButton(" Capture")
         self.screenshot_button.setIcon(get_icon_from_svg(SVG_CAMERA_ICON, icon_size))
         self.screenshot_button.clicked.connect(self.capture_screenshot)
+        self.screenshot_button.setToolTip("Capture screenshot (Ctrl+Shift+C)")
         tool_layout.addWidget(self.screenshot_button)
 
         self.save_measurement_button = QPushButton(" Save Data")
         self.save_measurement_button.setIcon(get_icon_from_svg(SVG_SAVE_ICON, icon_size))
         self.save_measurement_button.clicked.connect(self.save_measurement_data)
         self.save_measurement_button.setEnabled(False)
+        self.save_measurement_button.setToolTip("Save current measurement (Ctrl+Shift+S)")
         tool_layout.addWidget(self.save_measurement_button)
 
         tool_layout.addStretch()
@@ -889,10 +1000,73 @@ class ScanSectGUI(QMainWindow):
         filter_row.addWidget(self.meas_insect_filter)
 
         self.meas_sort_combo = QComboBox()
-        self.meas_sort_combo.addItems(["Newest First", "Oldest First", "Distance \u2191", "Distance \u2193"])
+        self.meas_sort_combo.addItems([
+            "Newest First",
+            "Oldest First",
+            "Distance \u2191",
+            "Distance \u2193",
+            "Angle \u2191",
+            "Angle \u2193",
+        ])
         self.meas_sort_combo.currentTextChanged.connect(self._apply_measurement_filters)
         filter_row.addWidget(self.meas_sort_combo)
         meas_layout.addLayout(filter_row)
+
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("Search:"))
+        self.meas_search_edit = QLineEdit()
+        self.meas_search_edit.setPlaceholderText("description, model, distance, timestamp, session")
+        self.meas_search_edit.textChanged.connect(self._apply_measurement_filters)
+        search_row.addWidget(self.meas_search_edit)
+        meas_layout.addLayout(search_row)
+
+        meas_scope_row = QHBoxLayout()
+        self.meas_current_model_only_chk = QCheckBox("Current Model")
+        self.meas_current_model_only_chk.stateChanged.connect(self._apply_measurement_filters)
+        meas_scope_row.addWidget(self.meas_current_model_only_chk)
+
+        self.meas_current_session_only_chk = QCheckBox("Current Session")
+        self.meas_current_session_only_chk.stateChanged.connect(self._apply_measurement_filters)
+        meas_scope_row.addWidget(self.meas_current_session_only_chk)
+        meas_scope_row.addStretch()
+        meas_layout.addLayout(meas_scope_row)
+
+        unit_row = QHBoxLayout()
+        unit_row.addWidget(QLabel("Display Unit:"))
+        self.meas_unit_combo = QComboBox()
+        self.meas_unit_combo.addItems(["mm", "cm", "um", "m"])
+        self.meas_unit_combo.setCurrentText("mm")
+        self.meas_unit_combo.currentTextChanged.connect(self._on_measurement_display_settings_changed)
+        unit_row.addWidget(self.meas_unit_combo)
+
+        unit_row.addWidget(QLabel("Scale to mm:"))
+        self.meas_scale_edit = QLineEdit("1.0")
+        self.meas_scale_edit.setPlaceholderText("Model units to mm")
+        self.meas_scale_edit.editingFinished.connect(self._on_measurement_display_settings_changed)
+        self.meas_scale_edit.setMaximumWidth(90)
+        unit_row.addWidget(self.meas_scale_edit)
+        unit_row.addStretch()
+        meas_layout.addLayout(unit_row)
+
+        self.session_measure_label = QLabel("Current Session Measurements")
+        self.session_measure_label.setObjectName("ArchiveTitle")
+        meas_layout.addWidget(self.session_measure_label)
+
+        self.session_measure_list = QListWidget()
+        self.session_measure_list.setObjectName("MeasurementListWidget")
+        self.session_measure_list.setMaximumHeight(120)
+        self.session_measure_list.itemSelectionChanged.connect(self._load_session_measurement)
+        meas_layout.addWidget(self.session_measure_list)
+
+        session_btn_row = QHBoxLayout()
+        self.session_export_btn = QPushButton("Export CSV")
+        self.session_export_btn.clicked.connect(self._export_session_measurements_csv)
+        session_btn_row.addWidget(self.session_export_btn)
+
+        self.session_clear_btn = QPushButton("Clear Session")
+        self.session_clear_btn.clicked.connect(self._clear_session_measurements)
+        session_btn_row.addWidget(self.session_clear_btn)
+        meas_layout.addLayout(session_btn_row)
 
         # List
         self.measurement_list = QListWidget()
@@ -902,6 +1076,12 @@ class ScanSectGUI(QMainWindow):
         self.measurement_list.itemSelectionChanged.connect(self._on_measurement_selection_changed)
         self.measurement_list.itemDoubleClicked.connect(self._on_measurement_double_clicked)
         meas_layout.addWidget(self.measurement_list)
+
+        self.measurement_empty_label = QLabel("No measurements found. Create one in Measure mode or adjust filters.")
+        self.measurement_empty_label.setObjectName("EmptyStateLabel")
+        self.measurement_empty_label.setAlignment(Qt.AlignCenter)
+        self.measurement_empty_label.hide()
+        meas_layout.addWidget(self.measurement_empty_label)
 
         # Detail inspector
         self.measurement_detail = MeasurementDetailWidget()
@@ -956,6 +1136,25 @@ class ScanSectGUI(QMainWindow):
         filter_row.addWidget(self.ss_insect_filter)
         ss_layout.addLayout(filter_row)
 
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("Search:"))
+        self.ss_search_edit = QLineEdit()
+        self.ss_search_edit.setPlaceholderText("description, model, timestamp, session, filename")
+        self.ss_search_edit.textChanged.connect(self._apply_screenshot_filters)
+        search_row.addWidget(self.ss_search_edit)
+        ss_layout.addLayout(search_row)
+
+        ss_scope_row = QHBoxLayout()
+        self.ss_current_model_only_chk = QCheckBox("Current Model")
+        self.ss_current_model_only_chk.stateChanged.connect(self._apply_screenshot_filters)
+        ss_scope_row.addWidget(self.ss_current_model_only_chk)
+
+        self.ss_current_session_only_chk = QCheckBox("Current Session")
+        self.ss_current_session_only_chk.stateChanged.connect(self._apply_screenshot_filters)
+        ss_scope_row.addWidget(self.ss_current_session_only_chk)
+        ss_scope_row.addStretch()
+        ss_layout.addLayout(ss_scope_row)
+
         # List with thumbnails
         self.screenshot_list = QListWidget()
         self.screenshot_list.setObjectName("ScreenshotListWidget")
@@ -964,6 +1163,12 @@ class ScanSectGUI(QMainWindow):
         self.screenshot_list.itemSelectionChanged.connect(self._on_screenshot_selection_changed)
         self.screenshot_list.itemDoubleClicked.connect(self._preview_screenshot)
         ss_layout.addWidget(self.screenshot_list)
+
+        self.screenshot_empty_label = QLabel("No screenshots found. Capture one or adjust filters.")
+        self.screenshot_empty_label.setObjectName("EmptyStateLabel")
+        self.screenshot_empty_label.setAlignment(Qt.AlignCenter)
+        self.screenshot_empty_label.hide()
+        ss_layout.addWidget(self.screenshot_empty_label)
 
         # Buttons
         btn_row = QHBoxLayout()
@@ -1032,6 +1237,38 @@ class ScanSectGUI(QMainWindow):
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(5)
         left_layout.addWidget(self._viewport_container, stretch=1)
+
+        self.quick_actions_bar = QFrame()
+        self.quick_actions_bar.setObjectName("QuickActionsBar")
+        quick_layout = QHBoxLayout(self.quick_actions_bar)
+        quick_layout.setContentsMargins(8, 6, 8, 6)
+        quick_layout.setSpacing(8)
+
+        self.qa_open_btn = QPushButton("Open")
+        self.qa_open_btn.clicked.connect(self.open_model_dialog)
+        quick_layout.addWidget(self.qa_open_btn)
+
+        self.qa_measure_btn = QPushButton("Measure")
+        self.qa_measure_btn.clicked.connect(self.measure_button.click)
+        quick_layout.addWidget(self.qa_measure_btn)
+
+        self.qa_capture_btn = QPushButton("Capture")
+        self.qa_capture_btn.clicked.connect(self.capture_screenshot)
+        quick_layout.addWidget(self.qa_capture_btn)
+
+        self.qa_save_btn = QPushButton("Save")
+        self.qa_save_btn.clicked.connect(self.save_measurement_data)
+        quick_layout.addWidget(self.qa_save_btn)
+
+        quick_layout.addStretch()
+        left_layout.addWidget(self.quick_actions_bar)
+
+        self.inline_alert_label = QLabel("")
+        self.inline_alert_label.setObjectName("InlineAlert")
+        self.inline_alert_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.inline_alert_label.hide()
+        left_layout.addWidget(self.inline_alert_label)
+
         left_layout.addWidget(self.tool_button_container)
 
         self.splitter = QSplitter(Qt.Horizontal)
@@ -1046,6 +1283,27 @@ class ScanSectGUI(QMainWindow):
         """)
         self.main_layout.addWidget(self.splitter)
 
+    def _show_inline_alert(self, message, level="info", timeout_ms=4000):
+        level_styles = {
+            "info": "background-color: #17324d; border-color: #2d8cf0; color: #d9ecff;",
+            "success": "background-color: #173d2a; border-color: #33b56a; color: #dcfce7;",
+            "warning": "background-color: #4b3313; border-color: #d9922b; color: #fdecc8;",
+            "error": "background-color: #4a1f24; border-color: #e05d6f; color: #ffe2e7;",
+        }
+        style = level_styles.get(level, level_styles["info"])
+        self.inline_alert_label.setStyleSheet(
+            f"border: 1px solid; border-radius: 5px; padding: 6px 10px; font-size: 9pt; {style}"
+        )
+        self.inline_alert_label.setText(message)
+        self.inline_alert_label.show()
+        QTimer.singleShot(timeout_ms, self.inline_alert_label.hide)
+
+    def _on_toggle_high_contrast(self, enabled):
+        self.high_contrast_enabled = bool(enabled)
+        self._apply_stylesheet()
+        mode = "enabled" if self.high_contrast_enabled else "disabled"
+        self._show_inline_alert(f"High contrast mode {mode}.", level="info")
+
     def _init_menus(self):
         menu_bar = self.menuBar()
         file_menu = menu_bar.addMenu("&File")
@@ -1059,6 +1317,29 @@ class ScanSectGUI(QMainWindow):
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
 
+        settings_menu = menu_bar.addMenu("&Settings")
+        self.high_contrast_action = QAction("High Contrast Mode", self)
+        self.high_contrast_action.setCheckable(True)
+        self.high_contrast_action.toggled.connect(self._on_toggle_high_contrast)
+        settings_menu.addAction(self.high_contrast_action)
+
+    def _init_shortcuts(self):
+        self.shortcut_toggle_measure = QShortcut(QKeySequence("M"), self)
+        self.shortcut_toggle_measure.activated.connect(self.measure_button.click)
+
+        self.shortcut_capture = QShortcut(QKeySequence("Ctrl+Shift+C"), self)
+        self.shortcut_capture.activated.connect(self.capture_screenshot)
+
+        self.shortcut_save_measure = QShortcut(QKeySequence("Ctrl+Shift+S"), self)
+        self.shortcut_save_measure.activated.connect(self.save_measurement_data)
+
+        self.shortcut_finish_polyline = QShortcut(QKeySequence("Ctrl+Enter"), self)
+        self.shortcut_finish_polyline.activated.connect(self._finish_polyline_measurement)
+
+        # Ctrl+O already exists in File menu; provide an additional explicit accelerator.
+        self.shortcut_open_model = QShortcut(QKeySequence("Ctrl+Shift+O"), self)
+        self.shortcut_open_model.activated.connect(self.open_model_dialog)
+
     def _init_interactor(self):
         self.custom_interactor_style = ScanSectUnifiedInteractorStyle.create()
         if hasattr(self.plotter, 'interactor') and self.plotter.interactor is not None:
@@ -1070,19 +1351,400 @@ class ScanSectGUI(QMainWindow):
     def _init_status_bar(self):
         self.status_bar = QStatusBar(self)
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready. Left-Click: Rotate. Open a 3D model to begin.")
+        self.status_bar.showMessage("Ready. Left-Click: Rotate. Open a 3D model to begin. Shortcuts: M, Ctrl+Shift+C, Ctrl+Shift+S, Ctrl+O, Ctrl+Enter")
+
+    def _unit_multiplier_from_mm(self, unit_name):
+        return unit_multiplier_from_mm(unit_name)
+
+    def _format_distance_from_mm(self, value_mm, decimals=2):
+        return format_distance_from_mm(value_mm, self.measurement_unit, decimals)
+
+    def _measurement_display_text(self, entry):
+        m_type = str(entry.get('measurement_type', 'distance')).lower()
+        if m_type == 'angle':
+            return f"{float(entry.get('angle_degrees', 0.0)):.2f} deg"
+        return self._format_distance_from_mm(self._measurement_entry_mm(entry), decimals=2)
+
+    def _measurement_entry_mm(self, entry):
+        if not isinstance(entry, dict):
+            return 0.0
+
+        value_mm = entry.get('distance_value_mm')
+        if value_mm is not None:
+            try:
+                return float(value_mm)
+            except Exception:
+                pass
+
+        m_type = str(entry.get('measurement_type', 'distance')).lower()
+        if m_type == 'angle':
+            return 0.0
+
+        dist_text = str(entry.get('distance', '0')).strip()
+        parts = dist_text.split()
+        try:
+            value = float(parts[0])
+        except Exception:
+            return 0.0
+
+        unit = parts[1].lower() if len(parts) > 1 else 'mm'
+        multiplier = self._unit_multiplier_from_mm(unit)
+        if multiplier <= 0:
+            return value
+        return value / multiplier
+
+    def _on_measurement_display_settings_changed(self):
+        self.measurement_unit = self.meas_unit_combo.currentText()
+
+        try:
+            scale_value = float(self.meas_scale_edit.text().strip())
+            if scale_value <= 0:
+                raise ValueError("Scale must be positive")
+            self.scale_to_mm = scale_value
+        except Exception:
+            self.meas_scale_edit.setText(f"{self.scale_to_mm:.6g}")
+            QMessageBox.warning(self, "Invalid Scale", "Scale to mm must be a positive number.")
+            return
+
+        if self.current_measurement:
+            points = self.current_measurement.get('points')
+            if points:
+                self._finalize_measurement_from_points(record_history=False)
+
+        self._refresh_measurement_list()
+
+    def _measurement_required_points(self):
+        mode = self.measurement_mode.lower()
+        if mode == 'distance':
+            return 2
+        if mode == 'angle':
+            return 3
+        return 2
+
+    def _measurement_mode_label(self):
+        mode = self.measurement_mode.lower()
+        if mode == 'distance':
+            return "Shift+LeftClick two vertices to measure distance."
+        if mode == 'angle':
+            return "Shift+LeftClick three vertices (middle point is angle vertex)."
+        return "Shift+LeftClick points to build polyline, then click Finish (Ctrl+Enter)."
+
+    def _measurement_step_text(self):
+        mode = self.measurement_mode.lower()
+        count = len(self._measurement_pick_points)
+        if mode == 'distance':
+            return f"Step {min(count + 1, 2)}/2" if count < 2 else "Ready to save"
+        if mode == 'angle':
+            return f"Step {min(count + 1, 3)}/3" if count < 3 else "Ready to save"
+        if count < 2:
+            return "Step 1/2"
+        return f"Points: {count} (finish to save)"
+
+    def _update_measure_ui_hints(self):
+        is_polyline = self.measurement_mode.lower() == 'polyline'
+        self.finish_measure_button.setEnabled(self.is_measuring and is_polyline and len(self._measurement_pick_points) >= 2)
+        if self.is_measuring:
+            self.status_bar.showMessage(f"Measurement mode [{self.measurement_mode}]: {self._measurement_mode_label()}")
+            self.measurement_display.update_context(self.measurement_mode, self._measurement_step_text())
+            self.measurement_display._distance_label.setText("Awaiting points")
+            self.measurement_display._coords_label.setText("")
+            self._position_measurement_display()
+
+    def _on_measurement_mode_changed(self, mode_text):
+        self.measurement_mode = mode_text
+        self._measurement_pick_points = []
+        self.current_measurement = {}
+        self._clear_measurement_visuals()
+        if self.is_measuring:
+            self._update_measure_ui_hints()
+        else:
+            self.measurement_display.clear_display()
+        self.save_measurement_button.setEnabled(False)
+
+    def _record_session_measurement(self, measurement_entry):
+        self.session_measurements.append(dict(measurement_entry))
+        self._refresh_session_measurement_list()
+
+    def _refresh_session_measurement_list(self):
+        self.session_measure_list.clear()
+        for idx, item in enumerate(self.session_measurements, start=1):
+            label = self._measurement_display_text(item)
+            m_type = str(item.get('measurement_type', 'distance')).capitalize()
+            li = QListWidgetItem(f"#{idx} {m_type}: {label}")
+            li.setData(Qt.UserRole, item)
+            self.session_measure_list.addItem(li)
+
+    def _load_session_measurement(self):
+        selected = self.session_measure_list.selectedItems()
+        if not selected:
+            return
+
+        if not self.is_measuring:
+            self.measure_button.setChecked(True)
+            self.toggle_measurement_mode()
+            if not self.is_measuring:
+                return
+
+        data = selected[0].data(Qt.UserRole)
+        points = data.get('points')
+        if not points:
+            p1 = data.get('point1')
+            p2 = data.get('point2')
+            if p1 and p2:
+                points = [p1, p2]
+
+        if not points:
+            return
+
+        self._measurement_pick_points = [[float(v) for v in p] for p in points]
+        self._draw_measurement_visuals()
+        self.measurement_mode = str(data.get('measurement_type', self.measurement_mode)).capitalize()
+        self.measure_mode_combo.blockSignals(True)
+        if self.measure_mode_combo.findText(self.measurement_mode) >= 0:
+            self.measure_mode_combo.setCurrentText(self.measurement_mode)
+        self.measure_mode_combo.blockSignals(False)
+        self._finalize_measurement_from_points(record_history=False)
+        self.save_measurement_button.setEnabled(True)
+        self._update_measure_ui_hints()
+
+    def _clear_session_measurements(self):
+        self.session_measurements = []
+        self._refresh_session_measurement_list()
+        self.session_measure_list.clearSelection()
+
+    def _export_session_measurements_csv(self):
+        if not self.session_measurements:
+            self._show_inline_alert("No session measurements to export yet.", level="warning")
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"session_measurements_{timestamp}.csv"
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Session Measurements",
+            os.path.join(os.path.expanduser("~"), default_name),
+            "CSV Files (*.csv);;All Files (*)",
+        )
+        if not save_path:
+            return
+
+        try:
+            with open(save_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "index",
+                    "type",
+                    "display_value",
+                    "distance_mm",
+                    "angle_degrees",
+                    "point_count",
+                    "points_json",
+                ])
+
+                for idx, item in enumerate(self.session_measurements, start=1):
+                    points = item.get('points', [])
+                    m_type = str(item.get('measurement_type', 'distance')).lower()
+                    writer.writerow([
+                        idx,
+                        m_type,
+                        self._measurement_display_text(item),
+                        float(item.get('distance_value_mm', 0.0)) if m_type != 'angle' else "",
+                        float(item.get('angle_degrees', 0.0)) if m_type == 'angle' else "",
+                        len(points),
+                        json.dumps(points),
+                    ])
+
+            self.status_bar.showMessage(f"Session measurements exported: {save_path}")
+            self._show_inline_alert(f"Session measurements exported: {os.path.basename(save_path)}", level="success")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Could not export CSV:\n{e}")
+
+    def _finish_polyline_measurement(self):
+        if self.measurement_mode.lower() != 'polyline' or not self.is_measuring:
+            return
+        if len(self._measurement_pick_points) < 2:
+            QMessageBox.warning(self, "Not Enough Points", "Pick at least two points for a polyline measurement.")
+            return
+        self._finalize_measurement_from_points(record_history=True)
+
+    def _get_display_mesh(self):
+        mesh = self.mesh_mgr.current_mesh
+        if mesh is None:
+            return None
+
+        if not self.clip_enabled:
+            return mesh
+
+        try:
+            bounds = mesh.bounds
+            z_min, z_max = bounds[4], bounds[5]
+            if z_max - z_min <= 1e-12:
+                return mesh
+
+            z_cut = z_min + (z_max - z_min) * self.clip_ratio
+            x_mid = 0.5 * (bounds[0] + bounds[1])
+            y_mid = 0.5 * (bounds[2] + bounds[3])
+            clipped = mesh.clip(normal='z', origin=(x_mid, y_mid, z_cut), invert=False)
+            if clipped is None or clipped.n_points == 0:
+                return mesh
+            return clipped
+        except Exception:
+            return mesh
+
+    def _apply_render_to_current_mesh(self, reset_camera=False):
+        if not self.mesh_mgr.has_model:
+            return
+
+        display_mesh = self._get_display_mesh()
+        if display_mesh is None:
+            return
+
+        if self.mesh_mgr.current_actor:
+            self.plotter.remove_actor(self.mesh_mgr.current_actor)
+
+        texture = self.mesh_mgr.get_first_texture()
+        use_texture = texture is not None and self.render_preset == "Textured"
+
+        if self.render_preset == "Wireframe":
+            self.mesh_mgr.current_actor = self.plotter.add_mesh(
+                display_mesh,
+                style='wireframe',
+                color='#00bcd4',
+                line_width=1.2,
+                lighting=False,
+            )
+        elif self.render_preset == "X-Ray":
+            self.mesh_mgr.current_actor = self.plotter.add_mesh(
+                display_mesh,
+                smooth_shading=True,
+                show_edges=True,
+                opacity=0.35,
+                color='#d9d9d9',
+                lighting=True,
+            )
+        elif self.render_preset == "Matte":
+            self.mesh_mgr.current_actor = self.plotter.add_mesh(
+                display_mesh,
+                smooth_shading=True,
+                show_edges=False,
+                color='#d9d9d9',
+                lighting=True,
+            )
+        else:
+            if use_texture:
+                self.mesh_mgr.current_actor = self.plotter.add_mesh(
+                    display_mesh,
+                    texture=texture,
+                    smooth_shading=True,
+                    show_edges=False,
+                    lighting=True,
+                    color='white',
+                )
+            else:
+                self.mesh_mgr.current_actor = self.plotter.add_mesh(
+                    display_mesh,
+                    smooth_shading=True,
+                    show_edges=False,
+                    lighting=True,
+                    color='white',
+                )
+
+        self.plotter.render()
+        if reset_camera:
+            self.plotter.reset_camera()
+        self.plotter.setFocus()
+
+    def _on_render_preset_changed(self, preset_name):
+        self.render_preset = preset_name
+        if self.mesh_mgr.has_model:
+            self._apply_render_to_current_mesh(reset_camera=False)
+
+    def _toggle_clip_mode(self):
+        if not self.mesh_mgr.has_model:
+            self.clip_toggle_button.setChecked(False)
+            QMessageBox.warning(self, "No Model", "Please load a 3D model before clipping.")
+            return
+
+        self.clip_enabled = self.clip_toggle_button.isChecked()
+        self.clip_slider.setEnabled(self.clip_enabled)
+        self._apply_render_to_current_mesh(reset_camera=False)
+
+        if self.clip_enabled:
+            self.status_bar.showMessage("Clipping enabled. Adjust the slider to change depth.")
+        else:
+            self.status_bar.showMessage("Clipping disabled.")
+
+    def _on_clip_slider_changed(self, slider_value):
+        self.clip_ratio = max(0.1, min(0.9, slider_value / 100.0))
+        if self.clip_enabled and self.mesh_mgr.has_model:
+            self._apply_render_to_current_mesh(reset_camera=False)
+
+    def _run_archive_integrity_check(self):
+        removed_screenshots = 0
+        removed_measurements = 0
+        fixed_thumbnails = 0
+        changed_screenshots = False
+        changed_measurements = False
+
+        valid_screenshots = []
+        for entry in self.archive_mgr.screenshots:
+            file_path = entry.get('file_path')
+            if not file_path or not os.path.exists(file_path):
+                removed_screenshots += 1
+                changed_screenshots = True
+                continue
+
+            updated = dict(entry)
+            thumb_path = updated.get('thumbnail_path')
+            if thumb_path and not os.path.exists(thumb_path):
+                updated['thumbnail_path'] = None
+                fixed_thumbnails += 1
+                changed_screenshots = True
+
+            valid_screenshots.append(updated)
+
+        valid_measurements = []
+        for entry in self.archive_mgr.measurements:
+            file_path = entry.get('file_path')
+            if not file_path or not os.path.exists(file_path):
+                removed_measurements += 1
+                changed_measurements = True
+                continue
+
+            updated = dict(entry)
+            thumb_path = updated.get('thumbnail_path')
+            if thumb_path and not os.path.exists(thumb_path):
+                updated['thumbnail_path'] = None
+                fixed_thumbnails += 1
+                changed_measurements = True
+
+            valid_measurements.append(updated)
+
+        if changed_screenshots:
+            self.archive_mgr.screenshots = valid_screenshots
+            self.archive_mgr.save_screenshots()
+
+        if changed_measurements:
+            self.archive_mgr.measurements = valid_measurements
+            self.archive_mgr.save_measurements()
+
+        total_removed = removed_screenshots + removed_measurements
+        if total_removed > 0 or fixed_thumbnails > 0:
+            self.status_bar.showMessage(
+                f"Archive integrity check: removed {total_removed} missing entries, fixed {fixed_thumbnails} thumbnails."
+            )
 
     def _apply_stylesheet(self):
-        self.setStyleSheet("""
+        base_stylesheet = """
             QMainWindow { background-color: #1e1e1e; }
-            QWidget { font-family: 'Segoe UI', Arial, sans-serif; font-size: 10pt; color: #e0e0e0; }
+            QWidget { font-family: 'Segoe UI', Arial, sans-serif; font-size: 10pt; color: #efefef; }
             QTextEdit#MetadataPanel {
-                background-color: #2c2c2c; color: #d0d0d0;
+                background-color: #2c2c2c; color: #ebebeb;
                 border: 1px solid #444444; border-radius: 6px;
-                padding: 10px; font-size: 9pt;
+                padding: 10px; font-size: 10pt;
             }
             QPushButton {
-                background-color: #333333; color: #e0e0e0;
+                background-color: #333333; color: #f2f2f2;
                 border: 1px solid #555555; border-radius: 5px;
                 padding: 6px 14px; min-height: 24px; icon-size: 16px;
             }
@@ -1090,6 +1752,7 @@ class ScanSectGUI(QMainWindow):
             QPushButton:pressed { background-color: #222222; }
             QPushButton:checked { background-color: #007acc; color: #ffffff; border: 1px solid #005c99; font-weight: bold; }
             QPushButton:disabled { background-color: #2a2a2a; color: #666666; border-color: #3a3a3a; }
+            QPushButton:focus { border: 2px solid #36a3ff; }
             QStatusBar { font-size: 9pt; color: #c0c0c0; background-color: #252525; border-top: 1px solid #333; }
             QMenuBar { background-color: #2b2b2b; color: #e0e0e0; }
             QMenuBar::item { background-color: transparent; padding: 4px 8px; }
@@ -1116,6 +1779,7 @@ class ScanSectGUI(QMainWindow):
                 border: 1px solid #555555; border-radius: 4px; padding: 4px 8px;
             }
             QComboBox:hover { border-color: #007acc; }
+            QComboBox:focus { border: 2px solid #36a3ff; }
             QComboBox QAbstractItemView {
                 background-color: #333333; color: #e0e0e0;
                 border: 1px solid #555555; selection-background-color: #007acc;
@@ -1124,7 +1788,29 @@ class ScanSectGUI(QMainWindow):
                 background-color: #333333; color: #e0e0e0;
                 border: 1px solid #555555; border-radius: 4px; padding: 4px 8px;
             }
-            QLineEdit:focus { border-color: #007acc; }
+            QLineEdit:focus { border: 2px solid #36a3ff; }
+            QListWidget:focus { border: 2px solid #36a3ff; }
+
+            QLabel#EmptyStateLabel {
+                background-color: #232f39;
+                border: 1px dashed #4f7186;
+                border-radius: 6px;
+                color: #d8eaf7;
+                font-size: 10pt;
+                padding: 12px;
+            }
+
+            QLabel#InlineAlert {
+                border-radius: 5px;
+                font-size: 9pt;
+                padding: 6px 10px;
+            }
+
+            QFrame#QuickActionsBar {
+                background-color: #212b33;
+                border: 1px solid #3a5566;
+                border-radius: 6px;
+            }
 
             /* --- Measurement Module Styling --- */
             QListWidget#MeasurementListWidget {
@@ -1178,12 +1864,20 @@ class ScanSectGUI(QMainWindow):
                 color: #4fc3f7; font-size: 9pt; font-weight: bold;
                 letter-spacing: 2px; background: transparent;
             }
+            QLabel#MeasurementModeBadge {
+                color: #d3ecff; background-color: rgba(79, 195, 247, 0.25);
+                border: 1px solid #4fc3f7; border-radius: 4px;
+                padding: 2px 6px; font-size: 8pt; font-weight: bold;
+            }
             QLabel#MeasurementValue {
                 color: #ffffff; font-size: 18pt; font-weight: bold;
                 background: transparent;
             }
             QLabel#MeasurementCoords {
                 color: #90a4ae; font-size: 8pt; background: transparent;
+            }
+            QLabel#MeasurementStep {
+                color: #b7d8ea; font-size: 8pt; background: transparent;
             }
 
             /* --- Measurement Detail Inspector --- */
@@ -1201,7 +1895,43 @@ class ScanSectGUI(QMainWindow):
             QLabel#MeasurementLinkedLabel {
                 color: #78909c; font-size: 8pt; background: transparent;
             }
-        """)
+        """
+
+        high_contrast_stylesheet = """
+            QMainWindow { background-color: #000000; }
+            QWidget { color: #ffffff; }
+            QMenuBar, QMenu, QStatusBar { background-color: #000000; color: #ffffff; }
+            QTextEdit#MetadataPanel, QListWidget#MeasurementListWidget, QListWidget#ScreenshotListWidget, QListWidget#ArchiveList {
+                background-color: #000000;
+                color: #ffffff;
+                border: 2px solid #ffffff;
+            }
+            QPushButton, QComboBox, QLineEdit {
+                background-color: #000000;
+                color: #ffffff;
+                border: 2px solid #ffffff;
+            }
+            QPushButton:hover, QComboBox:hover, QLineEdit:focus, QListWidget:focus {
+                border: 2px solid #ffd400;
+            }
+            QFrame#QuickActionsBar, QFrame#MeasurementDisplay, QFrame#MeasurementDetail {
+                background-color: #000000;
+                border: 2px solid #ffffff;
+            }
+            QLabel#MeasurementValue, QLabel#MeasurementTitle, QLabel#MeasurementModeBadge, QLabel#MeasurementStep,
+            QLabel#MeasurementCoords, QLabel#ArchiveTitle, QLabel#ToolGroupLabel, QLabel#EmptyStateLabel {
+                color: #ffffff;
+            }
+            QLabel#MeasurementModeBadge {
+                background-color: #000000;
+                border: 2px solid #ffd400;
+            }
+        """
+
+        if self.high_contrast_enabled:
+            self.setStyleSheet(base_stylesheet + high_contrast_stylesheet)
+        else:
+            self.setStyleSheet(base_stylesheet)
 
     # -----------------------------------------------------------------
     # Event Filter
@@ -1211,6 +1941,13 @@ class ScanSectGUI(QMainWindow):
         if obj == self.plotter:
             if not isinstance(event, QMouseEvent):
                 return super().eventFilter(obj, event)
+
+            if (self.is_measuring
+                    and self.measurement_mode.lower() == 'polyline'
+                    and event.type() == QEvent.MouseButtonPress
+                    and event.button() == Qt.RightButton):
+                self._finish_polyline_measurement()
+                return True
 
             if self.is_measuring and event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
                 # Keep navigation active during measurement mode.
@@ -1310,37 +2047,29 @@ class ScanSectGUI(QMainWindow):
         try:
             self.mesh_mgr.set_mesh(mesh, file_path)
             self.texture_button.setEnabled(True)
+            self.clip_toggle_button.setEnabled(True)
             # New session for each model load
             self._current_session_id = str(uuid.uuid4())[:8]
+            self._clear_session_measurements()
 
-            if self.mesh_mgr.current_actor:
-                self.plotter.remove_actor(self.mesh_mgr.current_actor)
-
-            texture_loaded = self.mesh_mgr.has_textures()
-            if texture_loaded:
-                self.mesh_mgr.current_actor = self.plotter.add_mesh(
-                    self.mesh_mgr.current_mesh, texture=self.mesh_mgr.get_first_texture(),
-                    smooth_shading=True, show_edges=False, lighting=True, color='white')
-            else:
-                self.mesh_mgr.current_actor = self.plotter.add_mesh(
-                    self.mesh_mgr.current_mesh, smooth_shading=True, show_edges=False, color='white')
-
-            self.plotter.render()
-            self.plotter.reset_camera()
-            self.plotter.setFocus()
+            self._apply_render_to_current_mesh(reset_camera=True)
             self._add_to_recent_models(file_path)
 
             mode = self.custom_interactor_style.current_left_click_mode.capitalize()
             if self.is_measuring:
                 self._measurement_pick_points = []
                 self.current_measurement = {}
+                self._clear_session_measurements()
                 self._clear_measurement_visuals()
                 self.measurement_display.clear_display()
                 self.save_measurement_button.setEnabled(False)
-                self.status_bar.showMessage("Model loaded. Measurement mode active: click two vertices to lock distance")
+                self._update_measure_ui_hints()
             else:
                 self.status_bar.showMessage(f"Loaded: {self.mesh_mgr.model_basename}. Polys: {mesh.n_cells:,}. Mode: {mode}")
+            texture_loaded = self.mesh_mgr.has_textures()
             self.metadata_panel.setText(self.mesh_mgr.get_metadata_text(texture_auto=texture_loaded))
+            self._apply_measurement_filters()
+            self._apply_screenshot_filters()
 
             if file_path.lower().endswith('.obj') and not texture_loaded:
                 QMessageBox.information(self, "No Texture Found",
@@ -1357,6 +2086,9 @@ class ScanSectGUI(QMainWindow):
         QMessageBox.critical(self, "Model Load Error", f"Could not load model:\n{error_message}")
         self.mesh_mgr.clear()
         self.texture_button.setEnabled(False)
+        self.clip_toggle_button.setEnabled(False)
+        self.clip_toggle_button.setChecked(False)
+        self.clip_slider.setEnabled(False)
 
     # -----------------------------------------------------------------
     # Texture
@@ -1383,12 +2115,7 @@ class ScanSectGUI(QMainWindow):
             if self.mesh_mgr.current_actor:
                 self.plotter.remove_actor(self.mesh_mgr.current_actor)
             self.mesh_mgr.current_texture = texture
-            self.mesh_mgr.current_actor = self.plotter.add_mesh(
-                self.mesh_mgr.current_mesh, texture=texture,
-                smooth_shading=True, show_edges=False, lighting=True, color='white')
-            self.plotter.render()
-            self.plotter.reset_camera()
-            self.plotter.setFocus()
+            self._apply_render_to_current_mesh(reset_camera=True)
             self.status_bar.showMessage(f"Texture '{os.path.basename(texture_path)}' applied!")
             self.metadata_panel.setText(self.mesh_mgr.get_metadata_text(texture_manual=True))
         except Exception as e:
@@ -1437,7 +2164,7 @@ class ScanSectGUI(QMainWindow):
                 self._clear_measurement_visuals()
                 self.measurement_display.clear_display()
                 self.save_measurement_button.setEnabled(False)
-                self.status_bar.showMessage("Measurement mode: Shift+LeftClick two vertices to lock distance. Drag normally to navigate.")
+                self._update_measure_ui_hints()
             except Exception as e:
                 self.measure_button.setChecked(False)
                 self.is_measuring = False
@@ -1448,6 +2175,7 @@ class ScanSectGUI(QMainWindow):
             self._cleanup_measurement_widgets()
             self.measurement_display.clear_display()
             self.save_measurement_button.setEnabled(False)
+            self.finish_measure_button.setEnabled(False)
             self.status_bar.clearMessage()
 
         self.plotter.render()
@@ -1459,6 +2187,7 @@ class ScanSectGUI(QMainWindow):
         self._clear_measurement_visuals()
         self._measurement_pick_points = []
         self.current_measurement = {}
+        self.finish_measure_button.setEnabled(False)
         if self.measurement_text_actor:
             self.plotter.renderer.RemoveActor(self.measurement_text_actor)
             self.measurement_text_actor = None
@@ -1476,9 +2205,11 @@ class ScanSectGUI(QMainWindow):
         vertex = self._pick_vertex_from_click(event.position())
         if vertex is None:
             self.status_bar.showMessage("No vertex selected. Click closer to a visible mesh vertex.")
+            self._show_inline_alert("No vertex selected. Click closer to the model.", level="warning")
             return
 
-        if len(self._measurement_pick_points) >= 2:
+        required_points = self._measurement_required_points()
+        if self.measurement_mode.lower() != 'polyline' and len(self._measurement_pick_points) >= required_points:
             self._measurement_pick_points = []
             self.current_measurement = {}
             self.save_measurement_button.setEnabled(False)
@@ -1487,11 +2218,21 @@ class ScanSectGUI(QMainWindow):
         self._measurement_pick_points.append(vertex)
         self._draw_measurement_visuals()
 
-        if len(self._measurement_pick_points) == 1:
-            self.status_bar.showMessage("First vertex locked. Shift+LeftClick a second vertex to finish measurement.")
-        elif len(self._measurement_pick_points) == 2:
-            self._update_measurement(self._measurement_pick_points[0], self._measurement_pick_points[1])
-            self.save_measurement_button.setEnabled(True)
+        mode = self.measurement_mode.lower()
+        if mode == 'polyline':
+            self.finish_measure_button.setEnabled(len(self._measurement_pick_points) >= 2)
+            self.status_bar.showMessage(f"Polyline points: {len(self._measurement_pick_points)}. Click Finish when done.")
+            self.measurement_display.update_context(self.measurement_mode, self._measurement_step_text())
+            self._position_measurement_display()
+            return
+
+        if len(self._measurement_pick_points) < required_points:
+            self.status_bar.showMessage(f"Point {len(self._measurement_pick_points)} locked. Need {required_points} points total.")
+            self.measurement_display.update_context(self.measurement_mode, self._measurement_step_text())
+            self._position_measurement_display()
+            return
+
+        self._finalize_measurement_from_points(record_history=True)
 
     def _pick_vertex_from_click(self, pos):
         if self._vertex_picker is None:
@@ -1556,45 +2297,107 @@ class ScanSectGUI(QMainWindow):
             self.plotter.renderer.AddActor(actor)
             self._measurement_marker_actors.append(actor)
 
-        if len(self._measurement_pick_points) == 2:
-            line = vtk.vtkLineSource()
-            line.SetPoint1(self._measurement_pick_points[0])
-            line.SetPoint2(self._measurement_pick_points[1])
+        if len(self._measurement_pick_points) >= 2:
+            for i in range(1, len(self._measurement_pick_points)):
+                line = vtk.vtkLineSource()
+                line.SetPoint1(self._measurement_pick_points[i - 1])
+                line.SetPoint2(self._measurement_pick_points[i])
 
-            mapper = vtk.vtkPolyDataMapper()
-            mapper.SetInputConnection(line.GetOutputPort())
+                mapper = vtk.vtkPolyDataMapper()
+                mapper.SetInputConnection(line.GetOutputPort())
 
-            self._measurement_line_actor = vtk.vtkActor()
-            self._measurement_line_actor.SetMapper(mapper)
-            self._measurement_line_actor.GetProperty().SetColor(0.31, 0.76, 0.97)
-            self._measurement_line_actor.GetProperty().SetLineWidth(3.0)
+                line_actor = vtk.vtkActor()
+                line_actor.SetMapper(mapper)
+                line_actor.GetProperty().SetColor(0.31, 0.76, 0.97)
+                line_actor.GetProperty().SetLineWidth(3.0)
 
-            self.plotter.renderer.AddActor(self._measurement_line_actor)
+                self.plotter.renderer.AddActor(line_actor)
+                self._measurement_line_actors.append(line_actor)
 
         self.plotter.render()
 
     def _clear_measurement_visuals(self):
-        if self._measurement_line_actor:
-            self.plotter.renderer.RemoveActor(self._measurement_line_actor)
-            self._measurement_line_actor = None
+        for actor in self._measurement_line_actors:
+            self.plotter.renderer.RemoveActor(actor)
+        self._measurement_line_actors = []
         for actor in self._measurement_marker_actors:
             self.plotter.renderer.RemoveActor(actor)
         self._measurement_marker_actors = []
+
+    def _finalize_measurement_from_points(self, record_history=True):
+        mode = self.measurement_mode.lower()
+        points = [list(p) for p in self._measurement_pick_points]
+        if mode == 'distance':
+            if len(points) < 2:
+                return
+            self._update_measurement(points[0], points[1])
+        elif mode == 'angle':
+            if len(points) < 3:
+                return
+            angle_value = angle_degrees(points[0], points[1], points[2])
+            self.current_measurement = {
+                'measurement_type': 'angle',
+                'points': points,
+                'point1': points[0],
+                'point2': points[1],
+                'point3': points[2],
+                'angle_degrees': angle_value,
+                'distance_value_mm': 0.0,
+            }
+            text = f"Angle: {angle_value:.2f} deg"
+            self.measurement_text_actor.SetInput(text)
+            self.status_bar.showMessage(text)
+            self.measurement_display.update_measurement(points[0], points[2], text)
+            self._position_measurement_display()
+            self.plotter.render()
+        else:
+            if len(points) < 2:
+                return
+            total_mm = polyline_mm(points, self.scale_to_mm)
+            self.current_measurement = {
+                'measurement_type': 'polyline',
+                'points': points,
+                'point1': points[0],
+                'point2': points[-1],
+                'distance': polyline_raw(points),
+                'distance_value_mm': total_mm,
+            }
+            text = f"Polyline: {self._format_distance_from_mm(total_mm, decimals=2)}"
+            self.measurement_text_actor.SetInput(text)
+            self.status_bar.showMessage(text)
+            self.measurement_display.update_measurement(points[0], points[-1], text)
+            self._position_measurement_display()
+            self.plotter.render()
+
+        self.save_measurement_button.setEnabled(True)
+        self.finish_measure_button.setEnabled(False)
+        self.measurement_display.update_context(self.measurement_mode, "Ready to save")
+        if record_history and self.current_measurement:
+            self._record_session_measurement(self.current_measurement)
 
     def _update_measurement(self, point1, point2):
         if not self.is_measuring or point1 is None or point2 is None:
             return
         _ensure_3d_libs()
-        distance = np.sqrt(sum((p2 - p1) ** 2 for p1, p2 in zip(point1, point2)))
+        raw_len = distance_raw(point1, point2)
+        value_mm = distance_mm(point1, point2, self.scale_to_mm)
 
-        self.current_measurement = {'point1': point1, 'point2': point2, 'distance': distance}
+        self.current_measurement = {
+            'measurement_type': 'distance',
+            'points': [point1, point2],
+            'point1': point1,
+            'point2': point2,
+            'distance': raw_len,
+            'distance_mm': value_mm,
+            'distance_value_mm': value_mm,
+        }
 
-        measurement_text = f"Distance: {distance:.2f} mm"
+        measurement_text = f"Distance: {self._format_distance_from_mm(value_mm, decimals=2)}"
         self.measurement_text_actor.SetInput(measurement_text)
         self.status_bar.showMessage(measurement_text)
 
         # Update the styled measurement overlay
-        self.measurement_display.update_measurement(point1, point2, distance)
+        self.measurement_display.update_measurement(point1, point2, self._format_distance_from_mm(value_mm, decimals=4))
         self._position_measurement_display()
 
         self.plotter.render()
@@ -1613,13 +2416,33 @@ class ScanSectGUI(QMainWindow):
 
     def create_thumbnail(self, image_path, thumbnail_size=(100, 100)):
         try:
+            if not image_path or not os.path.exists(image_path):
+                return None
+
+            cache_key = (image_path, int(thumbnail_size[0]), int(thumbnail_size[1]), os.path.getmtime(image_path))
+            cached = self._thumbnail_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
             pixmap = QPixmap(image_path)
             if pixmap.isNull():
                 return None
-            return pixmap.scaled(thumbnail_size[0], thumbnail_size[1],
-                                 Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            thumb = pixmap.scaled(thumbnail_size[0], thumbnail_size[1],
+                                  Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+            if len(self._thumbnail_cache) > 500:
+                self._thumbnail_cache.clear()
+            self._thumbnail_cache[cache_key] = thumb
+            return thumb
         except Exception:
             return None
+
+    def _invalidate_thumbnail_cache_for_path(self, path):
+        if not path:
+            return
+        keys_to_remove = [k for k in self._thumbnail_cache.keys() if k[0] == path]
+        for key in keys_to_remove:
+            self._thumbnail_cache.pop(key, None)
 
     def capture_model_thumbnail(self, save_path=None):
         try:
@@ -1665,7 +2488,7 @@ class ScanSectGUI(QMainWindow):
             self.archive_mgr.add_screenshot(entry)
             self._refresh_screenshot_list()
             self.status_bar.showMessage(f"Screenshot saved: {filename}")
-            QMessageBox.information(self, "Success", f"Screenshot saved!\n{filename}")
+            self._show_inline_alert(f"Screenshot saved: {filename}", level="success")
         except Exception as e:
             QMessageBox.critical(self, "Capture Error", f"Could not capture screenshot:\n{e}")
 
@@ -1687,6 +2510,14 @@ class ScanSectGUI(QMainWindow):
         try:
             thumb_saved = self.capture_model_thumbnail(thumb_path)
             m = self.current_measurement
+            m_type = str(m.get('measurement_type', 'distance')).lower()
+            points = m.get('points', [])
+            if not points and m.get('point1') and m.get('point2'):
+                points = [m['point1'], m['point2']]
+
+            distance_raw_value = float(m.get('distance', polyline_raw(points) if len(points) >= 2 else 0.0))
+            distance_mm_value = float(m.get('distance_value_mm', m.get('distance_mm', distance_raw_value * self.scale_to_mm)))
+            display_value = self._measurement_display_text(m)
             with open(file_path, 'w') as f:
                 f.write("ScanSect Measurement Data\n")
                 f.write("========================\n\n")
@@ -1694,27 +2525,42 @@ class ScanSectGUI(QMainWindow):
                 f.write(f"Model: {self.mesh_mgr.model_basename}\n")
                 f.write(f"Description: {description}\n\n")
                 f.write("Measurement:\n")
-                f.write(f"  Point 1: ({m['point1'][0]:.4f}, {m['point1'][1]:.4f}, {m['point1'][2]:.4f})\n")
-                f.write(f"  Point 2: ({m['point2'][0]:.4f}, {m['point2'][1]:.4f}, {m['point2'][2]:.4f})\n")
-                f.write(f"  Distance: {m['distance']:.4f} mm\n")
+                f.write(f"  Type: {m_type}\n")
+                for idx, p in enumerate(points, start=1):
+                    f.write(f"  Point {idx}: ({p[0]:.4f}, {p[1]:.4f}, {p[2]:.4f})\n")
+                f.write(f"  Scale to mm: {self.scale_to_mm:.6g}\n")
+                if m_type == 'angle':
+                    f.write(f"  Angle (deg): {float(m.get('angle_degrees', 0.0)):.6f}\n")
+                else:
+                    f.write(f"  Length (raw model units): {distance_raw_value:.6f}\n")
+                    f.write(f"  Length (mm): {distance_mm_value:.6f}\n")
+                f.write(f"  Display Value: {display_value}\n")
 
             entry = {
                 'session_id': self._current_session_id,
                 'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 'type': 'Measurement',
+                'measurement_type': m_type,
                 'description': description,
                 'file_path': file_path,
                 'thumbnail_path': thumb_path if thumb_saved else None,
                 'model_name': self.mesh_mgr.model_basename,
                 'model_path': self.mesh_mgr.current_path,
-                'distance': f"{m['distance']:.2f} mm",
-                'point1': m['point1'],
-                'point2': m['point2'],
+                'distance': display_value,
+                'distance_value_mm': distance_mm_value if m_type != 'angle' else 0.0,
+                'distance_raw': distance_raw_value,
+                'scale_to_mm': self.scale_to_mm,
+                'unit': self.measurement_unit,
+                'points': points,
+                'point1': points[0] if points else None,
+                'point2': points[1] if len(points) > 1 else None,
+                'point3': points[2] if len(points) > 2 else None,
+                'angle_degrees': float(m.get('angle_degrees', 0.0)) if m_type == 'angle' else None,
             }
             self.archive_mgr.add_measurement(entry)
             self._refresh_measurement_list()
             self.status_bar.showMessage(f"Measurement saved: {filename}")
-            QMessageBox.information(self, "Success", f"Measurement saved!\n{filename}")
+            self._show_inline_alert(f"Measurement saved: {filename}", level="success")
         except Exception as e:
             QMessageBox.critical(self, "Save Error", f"Could not save measurement data:\n{e}")
 
@@ -1762,12 +2608,20 @@ class ScanSectGUI(QMainWindow):
         self.measurement_list.clear()
         insect = self.meas_insect_filter.currentText()
         sort_mode = self.meas_sort_combo.currentText()
+        search_text = self.meas_search_edit.text().strip().lower()
 
         items = list(self.archive_mgr.measurements)
 
         # Filter
         if insect != "All Insects":
             items = [m for m in items if m.get('model_name') == insect]
+
+        if self.meas_current_model_only_chk.isChecked():
+            current_model = self.mesh_mgr.model_basename if self.mesh_mgr.has_model else None
+            items = [m for m in items if current_model and m.get('model_name') == current_model]
+
+        if self.meas_current_session_only_chk.isChecked():
+            items = [m for m in items if m.get('session_id') == self._current_session_id]
 
         # Sort
         if sort_mode == "Newest First":
@@ -1776,15 +2630,49 @@ class ScanSectGUI(QMainWindow):
             pass  # already chronological
         elif sort_mode.startswith("Distance"):
             reverse = "\u2193" in sort_mode
-            items.sort(key=lambda m: float(m.get('distance', '0').replace(' mm', '')), reverse=reverse)
+            items.sort(key=lambda m: self._measurement_entry_mm(m), reverse=reverse)
+        elif sort_mode.startswith("Angle"):
+            reverse = "\u2193" in sort_mode
+
+            def _angle_sort_value(entry):
+                m_type = str(entry.get('measurement_type', 'distance')).lower()
+                if m_type != 'angle':
+                    return float('-inf') if reverse else float('inf')
+                try:
+                    return float(entry.get('angle_degrees', 0.0))
+                except Exception:
+                    return 0.0
+
+            items.sort(key=_angle_sort_value, reverse=reverse)
+
+        if search_text:
+            def _meas_matches(entry):
+                haystack = " ".join([
+                    str(entry.get('description', '')),
+                    str(entry.get('model_name', '')),
+                    str(entry.get('distance', '')),
+                    str(entry.get('measurement_type', '')),
+                    str(entry.get('angle_degrees', '')),
+                    str(entry.get('timestamp', '')),
+                    str(entry.get('session_id', '')),
+                ]).lower()
+                return search_text in haystack
+
+            items = [m for m in items if _meas_matches(m)]
 
         for item in items:
-            dist = item.get('distance', 'N/A')
+            dist = self._measurement_display_text(item)
             desc = item.get('description', 'No description')
             ts = item.get('timestamp', '?')
             model = item.get('model_name', '?')
             sid = item.get('session_id', '')[:6]
-            display = f"\U0001F4CF {dist}  \u2014  {desc}\n   {model}  \u2022  {ts}  [{sid}]"
+            m_type = str(item.get('measurement_type', 'distance')).lower()
+            type_chip = {
+                'distance': '[DIST]',
+                'angle': '[ANGLE]',
+                'polyline': '[PATH]',
+            }.get(m_type, '[MEAS]')
+            display = f"{type_chip} {dist}\n{desc}\n{model}  \u2022  {ts}  [{sid}]"
             li = QListWidgetItem(display)
             li.setData(Qt.UserRole, item)
 
@@ -1796,6 +2684,10 @@ class ScanSectGUI(QMainWindow):
 
             self.measurement_list.addItem(li)
 
+        has_items = self.measurement_list.count() > 0
+        self.measurement_list.setVisible(has_items)
+        self.measurement_empty_label.setVisible(not has_items)
+
     def _on_measurement_selection_changed(self):
         has_sel = len(self.measurement_list.selectedItems()) > 0
         self.meas_load_btn.setEnabled(has_sel)
@@ -1804,9 +2696,11 @@ class ScanSectGUI(QMainWindow):
 
         if has_sel:
             data = self.measurement_list.selectedItems()[0].data(Qt.UserRole)
+            data_view = dict(data)
+            data_view['distance'] = self._measurement_display_text(data)
             sid = data.get('session_id', '')
             linked = self.archive_mgr.find_linked_screenshots(sid) if sid else []
-            self.measurement_detail.show_detail(data, linked)
+            self.measurement_detail.show_detail(data_view, linked)
         else:
             self.measurement_detail.show_detail(None)
 
@@ -1822,8 +2716,19 @@ class ScanSectGUI(QMainWindow):
         if not selected:
             return
         data = selected[0].data(Qt.UserRole)
-        if not data or 'point1' not in data or 'point2' not in data:
+        if not data:
             QMessageBox.warning(self, "Incomplete Data", "This measurement doesn't have position data.")
+            return
+
+        points = data.get('points')
+        if not points:
+            p1 = data.get('point1')
+            p2 = data.get('point2')
+            p3 = data.get('point3')
+            points = [p for p in [p1, p2, p3] if p is not None]
+
+        if len(points) < 2:
+            QMessageBox.warning(self, "Incomplete Data", "This measurement doesn't have enough position points.")
             return
         if not self.mesh_mgr.has_model:
             if 'model_path' in data and os.path.exists(data['model_path']):
@@ -1841,14 +2746,18 @@ class ScanSectGUI(QMainWindow):
                 self.measure_button.setChecked(True)
                 self.toggle_measurement_mode()
             if self.is_measuring:
-                point1 = [float(v) for v in data['point1']]
-                point2 = [float(v) for v in data['point2']]
-                self._measurement_pick_points = [point1, point2]
+                m_type = str(data.get('measurement_type', 'distance')).capitalize()
+                self.measurement_mode = m_type if m_type in ["Distance", "Angle", "Polyline"] else "Distance"
+                self.measure_mode_combo.blockSignals(True)
+                self.measure_mode_combo.setCurrentText(self.measurement_mode)
+                self.measure_mode_combo.blockSignals(False)
+
+                self._measurement_pick_points = [[float(v) for v in p] for p in points]
                 self._draw_measurement_visuals()
-                self._update_measurement(point1, point2)
+                self._finalize_measurement_from_points(record_history=False)
                 self.save_measurement_button.setEnabled(True)
                 desc = data.get('description', 'Loaded')
-                dist = data.get('distance', '?')
+                dist = self._measurement_display_text(data)
                 self.status_bar.showMessage(f"Loaded measurement: {desc} ({dist})")
                 self.right_panel_tabs.setCurrentIndex(0)
         except Exception as e:
@@ -1882,6 +2791,8 @@ class ScanSectGUI(QMainWindow):
                         os.remove(fp)
                     except Exception:
                         pass
+            self._invalidate_thumbnail_cache_for_path(data.get('thumbnail_path'))
+            self._invalidate_thumbnail_cache_for_path(data.get('file_path'))
             self.archive_mgr.remove_measurement(data)
         self._refresh_measurement_list()
 
@@ -1910,17 +2821,38 @@ class ScanSectGUI(QMainWindow):
     def _apply_screenshot_filters(self):
         self.screenshot_list.clear()
         insect = self.ss_insect_filter.currentText()
+        search_text = self.ss_search_edit.text().strip().lower()
 
         items = list(reversed(self.archive_mgr.screenshots))
         if insect != "All Insects":
             items = [s for s in items if s.get('model_name') == insect]
+
+        if self.ss_current_model_only_chk.isChecked():
+            current_model = self.mesh_mgr.model_basename if self.mesh_mgr.has_model else None
+            items = [s for s in items if current_model and s.get('model_name') == current_model]
+
+        if self.ss_current_session_only_chk.isChecked():
+            items = [s for s in items if s.get('session_id') == self._current_session_id]
+
+        if search_text:
+            def _ss_matches(entry):
+                haystack = " ".join([
+                    str(entry.get('description', '')),
+                    str(entry.get('model_name', '')),
+                    str(entry.get('timestamp', '')),
+                    str(entry.get('session_id', '')),
+                    os.path.basename(str(entry.get('file_path', ''))),
+                ]).lower()
+                return search_text in haystack
+
+            items = [s for s in items if _ss_matches(s)]
 
         for item in items:
             desc = item.get('description', 'No description')
             ts = item.get('timestamp', '?')
             model = item.get('model_name', '?')
             sid = item.get('session_id', '')[:6]
-            display = f"\U0001F4F7 {desc}\n   {model}  \u2022  {ts}  [{sid}]"
+            display = f"[SHOT] {desc}\n{model}  \u2022  {ts}  [{sid}]"
             li = QListWidgetItem(display)
             li.setData(Qt.UserRole, item)
 
@@ -1938,6 +2870,10 @@ class ScanSectGUI(QMainWindow):
                         li.setIcon(QIcon(thumb))
 
             self.screenshot_list.addItem(li)
+
+        has_items = self.screenshot_list.count() > 0
+        self.screenshot_list.setVisible(has_items)
+        self.screenshot_empty_label.setVisible(not has_items)
 
     def _on_screenshot_selection_changed(self):
         has_sel = len(self.screenshot_list.selectedItems()) > 0
@@ -1988,6 +2924,8 @@ class ScanSectGUI(QMainWindow):
                         os.remove(fp)
                     except Exception:
                         pass
+            self._invalidate_thumbnail_cache_for_path(data.get('thumbnail_path'))
+            self._invalidate_thumbnail_cache_for_path(data.get('file_path'))
             self.archive_mgr.remove_screenshot(data)
         self._refresh_screenshot_list()
 
@@ -2034,13 +2972,19 @@ class ScanSectGUI(QMainWindow):
                 with open(self.recent_models_file, 'r') as f:
                     return json.load(f)
             except Exception:
+                backup_path = f"{self.recent_models_file}.bak"
+                if os.path.exists(backup_path):
+                    try:
+                        with open(backup_path, 'r') as f:
+                            return json.load(f)
+                    except Exception:
+                        pass
                 return []
         return []
 
     def _save_recent_models(self):
         try:
-            with open(self.recent_models_file, 'w') as f:
-                json.dump(self.recent_models, f, indent=2)
+            atomic_write_json_with_backup(self.recent_models_file, self.recent_models)
         except Exception as e:
             print(f"Error saving recent models: {e}")
 
