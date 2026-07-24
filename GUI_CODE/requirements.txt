@@ -3,3 +3,4 @@ pyvista>=0.38.6
 pyvistaqt>=0.11
 vtk>=9.3
 numpy>=1.21.6
+
