@@ -61,5 +61,85 @@
       28.389923,
       -2.56315
     ]
+  },
+  {
+    "session_id": "c02e5edd",
+    "timestamp": "2026-10-21 11:42:29",
+    "type": "Measurement",
+    "measurement_type": "polyline",
+    "description": "Arm - Longhorn",
+    "file_path": "D:\\THESIS\\CODE\\ScanSect-Codes\\ScanSect-GUI\\GUI_CODE\\ScanSect_Archive\\Measurements\\THESIS_LONGHORN\\measurement_20261021_114229_813.txt",
+    "thumbnail_path": "D:\\THESIS\\CODE\\ScanSect-Codes\\ScanSect-GUI\\GUI_CODE\\ScanSect_Archive\\Measurements\\THESIS_LONGHORN\\thumb_20261021_114229_813.png",
+    "model_name": "THESIS_LONGHORN.obj",
+    "model_path": "D:/THESIS/THESIS-MODELING/REALITY CAPTURE/MODELS/TO BE TESTED/THESIS_LONGHORN.obj",
+    "distance": "8.49 mm",
+    "distance_value_mm": 8.489002416565858,
+    "distance_raw": 8.489002416565858,
+    "scale_to_mm": 1.0,
+    "unit": "mm",
+    "points": [
+      [
+        -3.25535,
+        49.465874,
+        5.526809
+      ],
+      [
+        3.457461,
+        45.9562,
+        9.358717
+      ]
+    ],
+    "point1": [
+      -3.25535,
+      49.465874,
+      5.526809
+    ],
+    "point2": [
+      3.457461,
+      45.9562,
+      9.358717
+    ],
+    "point3": null,
+    "angle_degrees": null
+  },
+  {
+    "session_id": "395a93d7",
+    "timestamp": "2026-10-21 11:50:34",
+    "type": "Measurement",
+    "measurement_type": "distance",
+    "description": "Leg",
+    "file_path": "D:\\THESIS\\CODE\\ScanSect-Codes\\ScanSect-GUI\\GUI_CODE\\ScanSect_Archive\\Measurements\\THESIS_LONGHORN\\measurement_20261021_115034_941.txt",
+    "thumbnail_path": "D:\\THESIS\\CODE\\ScanSect-Codes\\ScanSect-GUI\\GUI_CODE\\ScanSect_Archive\\Measurements\\THESIS_LONGHORN\\thumb_20261021_115034_941.png",
+    "model_name": "THESIS_LONGHORN.obj",
+    "model_path": "D:/THESIS/THESIS-MODELING/REALITY CAPTURE/MODELS/TO BE TESTED/THESIS_LONGHORN.obj",
+    "distance": "11.39 mm",
+    "distance_value_mm": 11.388350354736456,
+    "distance_raw": 11.388350354736456,
+    "scale_to_mm": 1.0,
+    "unit": "mm",
+    "points": [
+      [
+        -3.163841,
+        61.589413,
+        -6.386934
+      ],
+      [
+        -11.500706,
+        69.333214,
+        -6.861014
+      ]
+    ],
+    "point1": [
+      -3.163841,
+      61.589413,
+      -6.386934
+    ],
+    "point2": [
+      -11.500706,
+      69.333214,
+      -6.861014
+    ],
+    "point3": null,
+    "angle_degrees": null
   }
 ]

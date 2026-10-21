@@ -1,23 +1,10 @@
-"""
-ScanSect - 3D Insect Model Viewer (v12)
-========================================
-v12 changes:
-- Dedicated measurement visualization overlay with styled display
-- Separated Screenshot Module and Measurement Module tabs
-- Independent storage directories (/Screenshots, /Measurements)
-- Each module independently queries its own dataset
-- Shared linkage via session_id between screenshots and measurements
-- Screenshot preview with zoom dialog
-- Measurement detail inspector panel
-- Consistent styled measurement cards with accent color
-"""
+"""ScanSect 3D Insect Model Viewer main window and application entry point."""
 
 import sys
 import os
 import json
 import csv
 import uuid
-import shutil
 from datetime import datetime
 
 from PySide6.QtWidgets import (
@@ -30,7 +17,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QStatusBar,
     QTextEdit,
-    QSizePolicy,
     QPushButton,
     QButtonGroup,
     QAbstractButton,
@@ -39,22 +25,29 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QTabWidget,
-    QGroupBox,
-    QScrollArea,
     QDialog,
     QDialogButtonBox,
     QLineEdit,
     QComboBox,
     QSplitter,
-    QProgressBar,
     QSplashScreen,
-    QGridLayout,
     QSlider,
     QCheckBox,
 )
-from PySide6.QtGui import QAction, QKeySequence, QIcon, QMouseEvent, QPixmap, QPainter, QFont, QColor, QShortcut
-from PySide6.QtCore import Qt, QEvent, QObject, Slot, QByteArray, QSize, QThread, Signal, QTimer
-from PySide6.QtSvg import QSvgRenderer
+from PySide6.QtGui import (
+    QAction,
+    QKeySequence,
+    QIcon,
+    QMouseEvent,
+    QPixmap,
+    QPainter,
+    QFont,
+    QColor,
+    QShortcut,
+    QDesktopServices,
+)
+from PySide6.QtCore import Qt, QEvent, Slot, QSize, QTimer, QUrl
+
 from measurement_utils import (
     distance_raw,
     distance_mm,
@@ -63,702 +56,41 @@ from measurement_utils import (
     angle_degrees,
     unit_multiplier_from_mm,
     format_distance_from_mm,
+    atomic_write_json_with_backup,
+    load_json_with_backup,
+)
+from managers import (
+    ensure_3d_libs,
+    ModelLoaderWorker,
+    MeshManager,
+    ArchiveManager,
+)
+from widgets import (
+    SVG_MEASURE_ICON,
+    SVG_ROTATE_ICON,
+    SVG_PAN_ICON_ALT,
+    SVG_ZOOM_ICON,
+    SVG_OPEN_FILE_ICON,
+    SVG_TEXTURE_ICON,
+    SVG_SAVE_ICON,
+    SVG_ARCHIVE_ICON,
+    SVG_CAMERA_ICON,
+    get_icon_from_svg,
+    MeasurementDisplayWidget,
+    ScreenshotPreviewDialog,
+    MeasurementDetailWidget,
+    LoadingOverlay,
+    ScanSectUnifiedInteractorStyle,
 )
 
-# --- Lazy-loaded heavy libraries ---
-pv = None
-vtk = None
-np = None
-QtInteractor = None
-
-
-def _ensure_3d_libs():
-    """Lazy-load pyvista, vtk, numpy, and pyvistaqt on first use."""
-    global pv, vtk, np, QtInteractor
-    if pv is None:
-        import pyvista as _pv
-        import vtk as _vtk
-        import numpy as _np
-        from pyvistaqt import QtInteractor as _QtInteractor
-
-        pv = _pv
-        vtk = _vtk
-        np = _np
-        QtInteractor = _QtInteractor
-
-        pv.set_plot_theme('document')
-        pv.global_theme.window_size = [1024, 768]
-        pv.global_theme.font.size = 12
-        pv.global_theme.font.label_size = 12
-
-
-# --- SVG Icon Data ---
-ICON_COLOR = "#e0e0e0"
-
-SVG_MEASURE_ICON = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="{ICON_COLOR}" width="16px" height="16px"><path d="M21 6H3c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h18c.55 0 1-.45 1-1V7c0-.55-.45-1-1-1zm-1 10H4V8h16v8z"/><path d="M6 10h2v4H6zm4-1h2v6h-2zm4-2h2v8h-2zm4 1h2v6h-2z"/></svg>"""
-SVG_ROTATE_ICON = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="{ICON_COLOR}" width="16px" height="16px"><path d="M12 2c-5.52 0-10 4.48-10 10s4.48 10 10 10c2.76 0 5.26-1.12 7.07-2.93l-1.41-1.41C16.09 19.24 14.14 20 12 20c-4.41 0-8-3.59-8-8s3.59-8 8-8c2.08 0 3.96.79 5.41 2.09L13 10h7V3l-2.35 2.35C15.96 3.26 14.08 2 12 2z"/></svg>"""
-SVG_PAN_ICON_ALT = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="{ICON_COLOR}" width="16px" height="16px"><path d="M12 2l-4 4h3v2.04c-3.01.23-5.46 1.68-7.16 3.81l1.42 1.42C6.6 11.93 8.99 11 12 11s5.4 0.93 6.74 2.27l1.42-1.42C18.46 9.72 16.01 8.27 13 8.04V6h3l-4-4zm0 20l4-4h-3v-2.04c3.01-.23 5.46-1.68 7.16-3.81l-1.42-1.42C17.4 12.07 15.01 13 12 13s-5.4-0.93-6.74-2.27l-1.42 1.42c1.7 2.13 4.15 3.58 7.16 3.81V18h-3l4 4zM2 12l4-4v3h2.04c.23-3.01 1.68-5.46 3.81-7.16l1.42 1.42C11.93 6.6 11 8.99 11 12s0.93 5.4 2.27 6.74l-1.42 1.42c-2.13-1.7-3.58-4.15-3.81-7.16H7v3l-4-4z"/></svg>"""
-SVG_ZOOM_ICON = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="{ICON_COLOR}" width="16px" height="16px"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5A6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/><path d="M10.5 8H11v1.5H9.5V11h-1V9.5H7V8h1.5V6.5H10V8z" /></svg>"""
-SVG_OPEN_FILE_ICON = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="{ICON_COLOR}" width="16px" height="16px"><path d="M20 6h-8l-2-2H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V6h5.17l2 2H20v10z"/><path d="M0 0h24v24H0z" fill="none"/></svg>"""
-SVG_TEXTURE_ICON = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="{ICON_COLOR}" width="16px" height="16px"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H5V5h14v14zm-5.04-6.71l-2.75 3.54-1.96-2.36L6.5 17h11l-3.54-4.71z"/></svg>"""
-SVG_SAVE_ICON = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="{ICON_COLOR}" width="16px" height="16px"><path d="M17 3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V7l-4-4zm-5 16c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3zm3-10H5V5h10v4z"/></svg>"""
-SVG_ARCHIVE_ICON = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="{ICON_COLOR}" width="16px" height="16px"><path d="M20.54 5.23l-1.39-1.68C18.88 3.21 18.47 3 18 3H6c-.47 0-.88.21-1.16.55L3.46 5.23C3.17 5.57 3 6.02 3 6.5V19c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V6.5c0-.48-.17-.93-.46-1.27zM12 17.5L6.5 12H10v-2h4v2h3.5L12 17.5zM5.12 5l.81-1h12l.94 1H5.12z"/></svg>"""
-SVG_CAMERA_ICON = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="{ICON_COLOR}" width="16px" height="16px"><path d="M9 2L7.17 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2h-3.17L15 2H9zm3 15c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5z"/></svg>"""
-
-
-def get_icon_from_svg(svg_data_string, size=QSize(16, 16)):
-    renderer = QSvgRenderer(QByteArray(svg_data_string.encode('utf-8')))
-    pixmap = QPixmap(size)
-    pixmap.fill(Qt.transparent)
-    painter = QPainter(pixmap)
-    renderer.render(painter)
-    painter.end()
-    return QIcon(pixmap)
-
-
-def atomic_write_json_with_backup(file_path, data):
-    """Write JSON atomically and keep a .bak snapshot of the previous file."""
-    directory = os.path.dirname(file_path) or "."
-    os.makedirs(directory, exist_ok=True)
-    temp_path = f"{file_path}.tmp"
-    backup_path = f"{file_path}.bak"
-
-    try:
-        if os.path.exists(file_path):
-            shutil.copy2(file_path, backup_path)
-
-        with open(temp_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2)
-
-        os.replace(temp_path, file_path)
-    except Exception:
-        if os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
-        raise
-
-
-# =====================================================================
-# Worker Threads
-# =====================================================================
-
-class ModelLoaderWorker(QThread):
-    finished = Signal(object, str)
-    error = Signal(str, str)
-    progress = Signal(str)
-
-    def __init__(self, file_path):
-        super().__init__()
-        self.file_path = file_path
-
-    def run(self):
-        try:
-            _ensure_3d_libs()
-            self.progress.emit(f"Reading file: {os.path.basename(self.file_path)}...")
-            mesh = pv.read(self.file_path)
-
-            if mesh is None or mesh.n_points == 0:
-                self.error.emit(f"Loaded mesh is empty or invalid from file:\n{self.file_path}", self.file_path)
-                return
-
-            if self.file_path.lower().endswith('.obj'):
-                self.progress.emit("Searching for texture...")
-                self._load_obj_texture(mesh)
-
-            self.finished.emit(mesh, self.file_path)
-        except Exception as e:
-            self.error.emit(str(e), self.file_path)
-
-    def _load_obj_texture(self, mesh):
-        try:
-            mtl_texture_path = self._parse_mtl_file(self.file_path)
-            texture_path = self._find_texture_file(self.file_path, mtl_texture_path)
-            if texture_path:
-                try:
-                    texture = pv.read_texture(texture_path)
-                    mesh._scansect_texture = texture
-                except Exception as tex_error:
-                    print(f"Error loading texture file: {tex_error}")
-        except Exception as tex_error:
-            print(f"Error during texture search: {tex_error}")
-
-    def _parse_mtl_file(self, obj_file_path):
-        mtl_path = obj_file_path.replace('.obj', '.mtl')
-        if not os.path.exists(mtl_path):
-            return None
-        try:
-            with open(mtl_path, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith('map_Kd'):
-                        return line.split(None, 1)[1].strip()
-        except Exception:
-            pass
-        return None
-
-    def _find_texture_file(self, obj_file_path, mtl_texture_path=None):
-        obj_dir = os.path.dirname(obj_file_path)
-        base_name = os.path.splitext(os.path.basename(obj_file_path))[0]
-        search_paths = []
-
-        if mtl_texture_path:
-            search_paths.append(mtl_texture_path)
-            search_paths.append(os.path.join(obj_dir, os.path.basename(mtl_texture_path)))
-
-        common_extensions = ['.png', '.jpg', '.jpeg', '.bmp', '.tiff']
-        common_suffixes = ['', '_diffuse', '_u1_v1_diffuse', '_texture', '_color', '_basecolor']
-
-        for suffix in common_suffixes:
-            for ext in common_extensions:
-                search_paths.append(os.path.join(obj_dir, f"{base_name}{suffix}{ext}"))
-
-        for folder in ['textures', 'Textures', 'maps', 'Maps', 'images', 'Images']:
-            folder_path = os.path.join(obj_dir, folder)
-            if os.path.exists(folder_path):
-                for suffix in common_suffixes:
-                    for ext in common_extensions:
-                        search_paths.append(os.path.join(folder_path, f"{base_name}{suffix}{ext}"))
-
-        parent_dir = os.path.dirname(obj_dir)
-        if parent_dir and parent_dir != obj_dir:
-            for suffix in common_suffixes:
-                for ext in common_extensions:
-                    search_paths.append(os.path.join(parent_dir, f"{base_name}{suffix}{ext}"))
-
-        for path in search_paths:
-            if os.path.exists(path):
-                return path
-        return None
-
-
-# =====================================================================
-# MeshManager
-# =====================================================================
-
-class MeshManager:
-    def __init__(self):
-        self.current_mesh = None
-        self.current_path = None
-        self.current_actor = None
-        self.current_texture = None
-
-    @property
-    def has_model(self):
-        return self.current_mesh is not None
-
-    @property
-    def model_basename(self):
-        return os.path.basename(self.current_path) if self.current_path else "Unknown"
-
-    @property
-    def insect_name(self):
-        if self.current_path:
-            name = os.path.splitext(os.path.basename(self.current_path))[0]
-            return "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip()
-        return "Unknown"
-
-    def set_mesh(self, mesh, file_path):
-        self.current_mesh = mesh
-        self.current_path = file_path
-
-    def clear(self):
-        self.current_mesh = None
-        self.current_path = None
-        self.current_actor = None
-        self.current_texture = None
-
-    def has_textures(self):
-        if getattr(self.current_mesh, '_scansect_texture', None) is not None:
-            return True
-        if self.current_texture is not None:
-            return True
-        if self.current_mesh is None:
-            return False
-        if hasattr(self.current_mesh, 'textures') and isinstance(self.current_mesh.textures, dict):
-            return any(tex is not None for tex in self.current_mesh.textures.values())
-        return False
-
-    def has_uvs(self):
-        if self.current_mesh is None:
-            return False
-        return (hasattr(self.current_mesh, 'active_texture_coordinates')
-                and self.current_mesh.active_texture_coordinates is not None)
-
-    def get_first_texture(self):
-        if getattr(self.current_mesh, '_scansect_texture', None) is not None:
-            return self.current_mesh._scansect_texture
-        if self.current_texture is not None:
-            return self.current_texture
-        if self.has_textures():
-            return next(iter(self.current_mesh.textures.values()))
-        return None
-
-    def get_metadata_text(self, texture_auto=False, texture_manual=False):
-        mesh = self.current_mesh
-        if mesh is None:
-            return "No model loaded."
-        lines = [
-            "--- Model Information ---",
-            f"File Path: {self.model_basename}",
-            f"Number of Points: {mesh.n_points:,}",
-            f"Number of Polygons (Cells): {mesh.n_cells:,}",
-        ]
-        bounds = mesh.bounds
-        lines.append("Bounds (X, Y, Z min/max):")
-        lines.append(f"  X: {bounds[0]:.2f} to {bounds[1]:.2f}")
-        lines.append(f"  Y: {bounds[2]:.2f} to {bounds[3]:.2f}")
-        lines.append(f"  Z: {bounds[4]:.2f} to {bounds[5]:.2f}")
-
-        if texture_manual:
-            lines.append("Texture Status: Manually Applied")
-        elif texture_auto:
-            lines.append("Texture Status: Automatically Loaded (e.g., via MTL)")
-        elif self.has_textures():
-            lines.append("Texture Status: Present in mesh data")
-        else:
-            lines.append("Texture Status: None detected or applied")
-
-        if self.has_uvs():
-            lines.append("  Texture Coordinates (UVs): Present")
-        else:
-            lines.append("  Texture Coordinates (UVs): MISSING")
-
-        lines.append("\n--- ScanSect Specific Metadata (Placeholder) ---")
-        return "\n".join(lines)
-
-
-# =====================================================================
-# ArchiveManager - Separated storage for Screenshots and Measurements
-# =====================================================================
-
-class ArchiveManager:
-    """Manages archive data with separate storage for screenshots and measurements."""
-
-    def __init__(self, archive_dir):
-        self.archive_dir = archive_dir
-        self.screenshots_dir = os.path.join(archive_dir, "Screenshots")
-        self.measurements_dir = os.path.join(archive_dir, "Measurements")
-
-        for d in [self.archive_dir, self.screenshots_dir, self.measurements_dir]:
-            if not os.path.exists(d):
-                os.makedirs(d)
-
-        self.screenshots_index = os.path.join(self.screenshots_dir, "screenshots_index.json")
-        self.measurements_index = os.path.join(self.measurements_dir, "measurements_index.json")
-
-        # Migrate old unified archive if it exists
-        old_archive = os.path.join(archive_dir, "archive_metadata.json")
-        if os.path.exists(old_archive):
-            self._migrate_old_archive(old_archive)
-
-        self.screenshots = self._load_index(self.screenshots_index)
-        self.measurements = self._load_index(self.measurements_index)
-
-    def _migrate_old_archive(self, old_path):
-        """One-time migration from old unified archive to separated storage."""
-        if os.path.exists(self.screenshots_index) or os.path.exists(self.measurements_index):
-            return  # Already migrated
-        try:
-            with open(old_path, 'r') as f:
-                old_data = json.load(f)
-            screenshots = []
-            measurements = []
-            for item in old_data:
-                if 'session_id' not in item:
-                    item['session_id'] = str(uuid.uuid4())[:8]
-                if item.get('type') == 'Screenshot':
-                    screenshots.append(item)
-                elif item.get('type') == 'Measurement':
-                    measurements.append(item)
-            self._save_index(self.screenshots_index, screenshots)
-            self._save_index(self.measurements_index, measurements)
-            print(f"Migrated {len(screenshots)} screenshots and {len(measurements)} measurements from old archive.")
-        except Exception as e:
-            print(f"Error migrating old archive: {e}")
-
-    def _load_index(self, index_path):
-        if os.path.exists(index_path):
-            try:
-                with open(index_path, 'r') as f:
-                    return json.load(f)
-            except Exception as e:
-                print(f"Error loading index {index_path}: {e}")
-                backup_path = f"{index_path}.bak"
-                if os.path.exists(backup_path):
-                    try:
-                        with open(backup_path, 'r') as f:
-                            data = json.load(f)
-                        print(f"Recovered archive index from backup: {backup_path}")
-                        return data
-                    except Exception as backup_error:
-                        print(f"Backup recovery failed for {backup_path}: {backup_error}")
-        return []
-
-    def _save_index(self, index_path, data):
-        try:
-            atomic_write_json_with_backup(index_path, data)
-        except Exception as e:
-            print(f"Error saving index {index_path}: {e}")
-            raise
-
-    def save_screenshots(self):
-        self._save_index(self.screenshots_index, self.screenshots)
-
-    def save_measurements(self):
-        self._save_index(self.measurements_index, self.measurements)
-
-    def add_screenshot(self, entry):
-        if 'session_id' not in entry:
-            entry['session_id'] = str(uuid.uuid4())[:8]
-        self.screenshots.append(entry)
-        self.save_screenshots()
-
-    def add_measurement(self, entry):
-        if 'session_id' not in entry:
-            entry['session_id'] = str(uuid.uuid4())[:8]
-        self.measurements.append(entry)
-        self.save_measurements()
-
-    def remove_screenshot(self, entry):
-        if entry in self.screenshots:
-            self.screenshots.remove(entry)
-            self.save_screenshots()
-
-    def remove_measurement(self, entry):
-        if entry in self.measurements:
-            self.measurements.remove(entry)
-            self.save_measurements()
-
-    def get_screenshot_path(self, insect_name="Unknown"):
-        p = os.path.join(self.screenshots_dir, insect_name)
-        if not os.path.exists(p):
-            os.makedirs(p)
-        return p
-
-    def get_measurement_path(self, insect_name="Unknown"):
-        p = os.path.join(self.measurements_dir, insect_name)
-        if not os.path.exists(p):
-            os.makedirs(p)
-        return p
-
-    def get_unique_insect_names(self):
-        names = set()
-        for item in self.screenshots + self.measurements:
-            name = item.get('model_name', 'Unknown')
-            if name != 'Unknown':
-                names.add(name)
-        return sorted(names)
-
-    def find_linked_screenshots(self, session_id):
-        return [s for s in self.screenshots if s.get('session_id') == session_id]
-
-    def find_linked_measurements(self, session_id):
-        return [m for m in self.measurements if m.get('session_id') == session_id]
-
-
-# =====================================================================
-# Measurement Display Widget (Styled Visualization Layer)
-# =====================================================================
-
-class MeasurementDisplayWidget(QFrame):
-    """Styled measurement display card rendered in the viewport overlay area."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setObjectName("MeasurementDisplay")
-        self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setAutoFillBackground(True)
-        self.setFixedHeight(122)
-        self.hide()
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(2)
-
-        # Title row
-        title_row = QHBoxLayout()
-        self._icon_label = QLabel("\U0001F4CF")
-        self._icon_label.setStyleSheet("font-size: 16pt; background: transparent;")
-        title_row.addWidget(self._icon_label)
-
-        self._title = QLabel("MEASUREMENT")
-        self._title.setObjectName("MeasurementTitle")
-        title_row.addWidget(self._title)
-        self._mode_badge = QLabel("DISTANCE")
-        self._mode_badge.setObjectName("MeasurementModeBadge")
-        title_row.addWidget(self._mode_badge)
-        title_row.addStretch()
-        layout.addLayout(title_row)
-
-        # Distance value (large, prominent)
-        self._distance_label = QLabel("0.00 mm")
-        self._distance_label.setObjectName("MeasurementValue")
-        layout.addWidget(self._distance_label)
-
-        # Coordinates row
-        self._coords_label = QLabel("")
-        self._coords_label.setObjectName("MeasurementCoords")
-        layout.addWidget(self._coords_label)
-
-        self._step_label = QLabel("")
-        self._step_label.setObjectName("MeasurementStep")
-        layout.addWidget(self._step_label)
-
-    def update_measurement(self, point1, point2, distance_text):
-        self._distance_label.setText(distance_text)
-        self._coords_label.setText(
-            f"P1: ({point1[0]:.2f}, {point1[1]:.2f}, {point1[2]:.2f})  \u2192  "
-            f"P2: ({point2[0]:.2f}, {point2[1]:.2f}, {point2[2]:.2f})"
-        )
-        if not self.isVisible():
-            self.show()
-
-    def update_context(self, mode_text, step_text):
-        self._mode_badge.setText((mode_text or "").upper())
-        self._step_label.setText(step_text or "")
-        if not self.isVisible():
-            self.show()
-
-    def clear_display(self):
-        self._distance_label.setText("0.00 mm")
-        self._coords_label.setText("")
-        self._step_label.setText("")
-        self.hide()
-
-
-# =====================================================================
-# Screenshot Preview Dialog
-# =====================================================================
-
-class ScreenshotPreviewDialog(QDialog):
-    """Zoomable preview dialog for screenshots."""
-
-    def __init__(self, image_path, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"Preview: {os.path.basename(image_path)}")
-        self.setMinimumSize(600, 500)
-        self._zoom_level = 1.0
-        self._pixmap = QPixmap(image_path)
-
-        layout = QVBoxLayout(self)
-
-        # Image container in scroll area
-        self._image_label = QLabel()
-        self._image_label.setAlignment(Qt.AlignCenter)
-        self._image_label.setPixmap(self._pixmap)
-
-        scroll = QScrollArea()
-        scroll.setWidget(self._image_label)
-        scroll.setWidgetResizable(False)
-        scroll.setAlignment(Qt.AlignCenter)
-        layout.addWidget(scroll, stretch=1)
-
-        # Zoom controls
-        zoom_row = QHBoxLayout()
-        zoom_in = QPushButton("Zoom In (+)")
-        zoom_in.clicked.connect(self._zoom_in)
-        zoom_row.addWidget(zoom_in)
-
-        self._zoom_label = QLabel("100%")
-        self._zoom_label.setAlignment(Qt.AlignCenter)
-        self._zoom_label.setMinimumWidth(60)
-        zoom_row.addWidget(self._zoom_label)
-
-        zoom_out = QPushButton("Zoom Out (-)")
-        zoom_out.clicked.connect(self._zoom_out)
-        zoom_row.addWidget(zoom_out)
-
-        fit_btn = QPushButton("Fit to Window")
-        fit_btn.clicked.connect(self._fit_to_window)
-        zoom_row.addWidget(fit_btn)
-
-        layout.addLayout(zoom_row)
-
-        # Info row
-        info = QLabel(f"Size: {self._pixmap.width()}\u00d7{self._pixmap.height()} px  |  File: {image_path}")
-        info.setStyleSheet("color: #888; font-size: 8pt;")
-        layout.addWidget(info)
-
-        self._apply_zoom()
-
-    def _zoom_in(self):
-        self._zoom_level = min(self._zoom_level + 0.25, 5.0)
-        self._apply_zoom()
-
-    def _zoom_out(self):
-        self._zoom_level = max(self._zoom_level - 0.25, 0.25)
-        self._apply_zoom()
-
-    def _fit_to_window(self):
-        if self._pixmap.isNull():
-            return
-        available = self.size() - QSize(40, 120)
-        scale_w = available.width() / self._pixmap.width()
-        scale_h = available.height() / self._pixmap.height()
-        self._zoom_level = min(scale_w, scale_h, 5.0)
-        self._apply_zoom()
-
-    def _apply_zoom(self):
-        if self._pixmap.isNull():
-            return
-        new_size = self._pixmap.size() * self._zoom_level
-        scaled = self._pixmap.scaled(new_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self._image_label.setPixmap(scaled)
-        self._image_label.resize(scaled.size())
-        self._zoom_label.setText(f"{int(self._zoom_level * 100)}%")
-
-
-# =====================================================================
-# Measurement Detail Inspector
-# =====================================================================
-
-class MeasurementDetailWidget(QFrame):
-    """Detailed view of a single measurement record, shown below the measurement list."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setObjectName("MeasurementDetail")
-        self.setMinimumHeight(140)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(4)
-
-        header = QLabel("Measurement Detail")
-        header.setObjectName("MeasurementDetailHeader")
-        layout.addWidget(header)
-
-        self._detail_text = QLabel("Select a measurement to view details.")
-        self._detail_text.setObjectName("MeasurementDetailText")
-        self._detail_text.setWordWrap(True)
-        layout.addWidget(self._detail_text)
-
-        self._linked_label = QLabel("")
-        self._linked_label.setObjectName("MeasurementLinkedLabel")
-        self._linked_label.setWordWrap(True)
-        layout.addWidget(self._linked_label)
-        layout.addStretch()
-
-    def show_detail(self, data, linked_screenshots=None):
-        if not data:
-            self._detail_text.setText("Select a measurement to view details.")
-            self._linked_label.setText("")
-            return
-
-        dist = data.get('distance', 'N/A')
-        m_type = str(data.get('measurement_type', 'distance')).capitalize()
-        desc = data.get('description', 'No description')
-        ts = data.get('timestamp', 'Unknown')
-        model = data.get('model_name', 'Unknown')
-        sid = data.get('session_id', 'N/A')
-
-        p1 = data.get('point1', [0, 0, 0])
-        p2 = data.get('point2', [0, 0, 0])
-        p3 = data.get('point3')
-
-        self._detail_text.setText(
-            f"<b>Type:</b> {m_type}<br/>"
-            f"<b>Distance:</b> <span style='color: #4fc3f7; font-size: 12pt;'>{dist}</span><br/>"
-            f"<b>Description:</b> {desc}<br/>"
-            f"<b>Model:</b> {model}<br/>"
-            f"<b>Timestamp:</b> {ts}<br/>"
-            f"<b>Session ID:</b> <span style='color: #888;'>{sid}</span><br/>"
-            f"<b>P1:</b> ({p1[0]:.3f}, {p1[1]:.3f}, {p1[2]:.3f})&nbsp;&nbsp;"
-            f"<b>P2:</b> ({p2[0]:.3f}, {p2[1]:.3f}, {p2[2]:.3f})"
-            + (f"<br/><b>P3:</b> ({p3[0]:.3f}, {p3[1]:.3f}, {p3[2]:.3f})" if p3 else "")
-        )
-
-        if linked_screenshots:
-            names = ", ".join(os.path.basename(s.get('file_path', '?')) for s in linked_screenshots)
-            self._linked_label.setText(f"\U0001F517 Linked screenshots: {names}")
-        else:
-            self._linked_label.setText("\U0001F517 No linked screenshots")
-
-
-# =====================================================================
-# Loading Overlay Widget
-# =====================================================================
-
-class LoadingOverlay(QWidget):
-    """Opaque overlay shown during model loading.
-    Must be parented to a regular QWidget container, NOT VTK/OpenGL widget.
-    """
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setAutoFillBackground(True)
-        self.setStyleSheet("background-color: #1a1a1a;")
-        self.hide()
-
-        layout = QVBoxLayout(self)
-        layout.setAlignment(Qt.AlignCenter)
-
-        self._label = QLabel("Loading model...")
-        self._label.setAlignment(Qt.AlignCenter)
-        self._label.setStyleSheet("color: #ffffff; font-size: 14pt; font-weight: bold; background: transparent;")
-        layout.addWidget(self._label)
-
-        self._progress = QProgressBar()
-        self._progress.setRange(0, 0)
-        self._progress.setFixedWidth(300)
-        self._progress.setStyleSheet("""
-            QProgressBar { border: 1px solid #555; border-radius: 4px; background: #2c2c2c; height: 20px; }
-            QProgressBar::chunk { background-color: #007acc; border-radius: 3px; }
-        """)
-        layout.addWidget(self._progress, alignment=Qt.AlignCenter)
-
-    def show_message(self, text):
-        self._label.setText(text)
-        if self.parent():
-            self.setGeometry(self.parent().rect())
-        self.show()
-        self.raise_()
-
-    def hide_overlay(self):
-        self.hide()
-
-
-# =====================================================================
-# Interactor Style (lazy VTK)
-# =====================================================================
-
-class ScanSectUnifiedInteractorStyle:
-    @classmethod
-    def create(cls): 
-        _ensure_3d_libs()
-
-        class _Style(vtk.vtkInteractorStyleTrackballCamera):
-            def __init__(self):
-                super().__init__()
-                self.current_left_click_mode = "rotate"
-            def set_left_click_mode(self, mode_str):
-                self.current_left_click_mode = mode_str.lower()
-            def OnLeftButtonDown(self): super().OnLeftButtonDown()
-            def OnLeftButtonUp(self): super().OnLeftButtonUp()
-            def OnMiddleButtonDown(self): super().OnMiddleButtonDown()
-            def OnMiddleButtonUp(self): super().OnMiddleButtonUp()
-            def OnRightButtonDown(self): super().OnRightButtonDown()
-            def OnRightButtonUp(self): super().OnRightButtonUp()
-
-        return _Style()
-
-
-# =====================================================================
-# Main GUI
-# =====================================================================
 
 class ScanSectGUI(QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("ScanSect - 3D Insect Model Viewer")
-        self.setGeometry(100, 100, 1400, 850)
+        self.setGeometry(100, 100, 1440, 880)
 
-        # Core state
         self.is_measuring = False
-        self.line_widget = None
         self.measurement_text_actor = None
         self.current_measurement = {}
         self._measurement_pick_points = []
@@ -769,7 +101,7 @@ class ScanSectGUI(QMainWindow):
         self._vertex_picker = None
         self._active_remapped_button = Qt.NoButton
         self._loader_worker = None
-        self._save_worker = None
+        self._pending_measurement_data = None
         self._current_session_id = str(uuid.uuid4())[:8]
         self.measurement_unit = "mm"
         self.scale_to_mm = 1.0
@@ -779,21 +111,17 @@ class ScanSectGUI(QMainWindow):
         self.high_contrast_enabled = False
         self._thumbnail_cache = {}
 
-        # Managers
         script_dir = os.path.dirname(os.path.abspath(__file__))
         self.mesh_mgr = MeshManager()
         self.archive_mgr = ArchiveManager(os.path.join(script_dir, "ScanSect_Archive"))
 
-        # Recent models
         self.recent_models_file = os.path.join(script_dir, "recent_models.json")
         self.recent_models = self._load_recent_models()
 
-        # Window icon
         app_icon_path = os.path.join(script_dir, "ScanSect ICON.png")
         if os.path.exists(app_icon_path):
             self.setWindowIcon(QIcon(app_icon_path))
 
-        # Build UI
         self._init_3d_viewport()
         self._init_toolbar()
         self._init_side_panel()
@@ -805,17 +133,12 @@ class ScanSectGUI(QMainWindow):
         self._apply_stylesheet()
         self._run_archive_integrity_check()
 
-        # Initial data refresh
         self._refresh_screenshot_list()
         self._refresh_measurement_list()
         self._refresh_recent_models_list()
 
-    # -----------------------------------------------------------------
-    # UI Initialization
-    # -----------------------------------------------------------------
-
     def _init_3d_viewport(self):
-        _ensure_3d_libs()
+        _, _, _, QtInteractor = ensure_3d_libs()
         self._viewport_container = QWidget()
         self._viewport_layout = QVBoxLayout(self._viewport_container)
         self._viewport_layout.setContentsMargins(0, 0, 0, 0)
@@ -830,155 +153,172 @@ class ScanSectGUI(QMainWindow):
         self.plotter.background_color = 'white'
         self._viewport_layout.addWidget(self.plotter, stretch=1)
 
-        # Measurement display overlay (anchored at bottom of viewport)
-        self.measurement_display = MeasurementDisplayWidget(self._viewport_container)
-
-        # Loading overlay
+        self.measurement_display = MeasurementDisplayWidget()
         self.loading_overlay = LoadingOverlay(self._viewport_container)
 
     def _init_toolbar(self):
-        self.tool_button_container = QWidget()
-        self.tool_button_container.setObjectName("ToolButtonContainer")
-        tool_layout = QHBoxLayout(self.tool_button_container)
-        tool_layout.setContentsMargins(0, 5, 0, 5)
-        tool_layout.setSpacing(10)
+        """Split controls into a top Display/File bar and a bottom Camera/Measure bar
+        so buttons never crowd into a single horizontal strip.
+        """
+        icon_size = QSize(16, 16)
 
-        self.interaction_mode_group = QButtonGroup(self)
-        self.interaction_mode_group.setExclusive(True)
-        icon_size = QSize(20, 20)
-        tool_layout.addStretch()
+        # Top Viewport Header: Model file, Surface appearance, Z-Sectioning, and Capture
+        self.top_viewport_bar = QFrame()
+        self.top_viewport_bar.setObjectName("TopViewportBar")
+        top_layout = QHBoxLayout(self.top_viewport_bar)
+        top_layout.setContentsMargins(12, 8, 12, 8)
+        top_layout.setSpacing(10)
 
-        nav_label = QLabel("Navigation:")
-        nav_label.setObjectName("ToolGroupLabel")
-        tool_layout.addWidget(nav_label)
+        self.open_model_button = QPushButton("Open Model")
+        self.open_model_button.setIcon(get_icon_from_svg(SVG_OPEN_FILE_ICON, icon_size))
+        self.open_model_button.clicked.connect(self.open_model_dialog)
+        self.open_model_button.setToolTip("Open 3D model or texture (Ctrl+O)")
+        top_layout.addWidget(self.open_model_button)
 
-        self.rotate_button = QPushButton(" Rotate")
-        self.rotate_button.setIcon(get_icon_from_svg(SVG_ROTATE_ICON, icon_size))
-        self.rotate_button.setCheckable(True)
-        self.rotate_button.setChecked(True)
-        tool_layout.addWidget(self.rotate_button)
-        self.interaction_mode_group.addButton(self.rotate_button)
-
-        self.pan_button = QPushButton(" Pan")
-        self.pan_button.setIcon(get_icon_from_svg(SVG_PAN_ICON_ALT, icon_size))
-        self.pan_button.setCheckable(True)
-        tool_layout.addWidget(self.pan_button)
-        self.interaction_mode_group.addButton(self.pan_button)
-
-        self.zoom_button = QPushButton(" Zoom")
-        self.zoom_button.setIcon(get_icon_from_svg(SVG_ZOOM_ICON, icon_size))
-        self.zoom_button.setCheckable(True)
-        tool_layout.addWidget(self.zoom_button)
-        self.interaction_mode_group.addButton(self.zoom_button)
-
-        tool_layout.addWidget(self._make_separator())
-
-        tools_label = QLabel("Tools:")
-        tools_label.setObjectName("ToolGroupLabel")
-        tool_layout.addWidget(tools_label)
-
-        self.measure_button = QPushButton(" Measure")
-        self.measure_button.setIcon(get_icon_from_svg(SVG_MEASURE_ICON, icon_size))
-        self.measure_button.setCheckable(True)
-        self.measure_button.clicked.connect(self.toggle_measurement_mode)
-        self.measure_button.setToolTip("Toggle measurement mode (M)")
-        tool_layout.addWidget(self.measure_button)
-
-        self.measure_mode_combo = QComboBox()
-        self.measure_mode_combo.addItems(["Distance", "Angle", "Polyline"])
-        self.measure_mode_combo.currentTextChanged.connect(self._on_measurement_mode_changed)
-        self.measure_mode_combo.setToolTip("Measurement mode")
-        tool_layout.addWidget(self.measure_mode_combo)
-
-        self.finish_measure_button = QPushButton(" Finish")
-        self.finish_measure_button.clicked.connect(self._finish_polyline_measurement)
-        self.finish_measure_button.setEnabled(False)
-        self.finish_measure_button.setToolTip("Finish polyline measurement")
-        tool_layout.addWidget(self.finish_measure_button)
-
-        self.texture_button = QPushButton(" Load Texture")
+        self.texture_button = QPushButton("Load Texture")
         self.texture_button.setIcon(get_icon_from_svg(SVG_TEXTURE_ICON, icon_size))
         self.texture_button.clicked.connect(self.load_texture_dialog)
         self.texture_button.setEnabled(False)
-        tool_layout.addWidget(self.texture_button)
+        self.texture_button.setToolTip("Apply image texture to current model")
+        top_layout.addWidget(self.texture_button)
+
+        top_layout.addWidget(self._make_separator())
+
+        view_label = QLabel("Surface")
+        view_label.setObjectName("ToolGroupLabel")
+        top_layout.addWidget(view_label)
 
         self.render_preset_combo = QComboBox()
         self.render_preset_combo.addItems(["Textured", "Matte", "Wireframe", "X-Ray"])
         self.render_preset_combo.currentTextChanged.connect(self._on_render_preset_changed)
         self.render_preset_combo.setToolTip("Viewport render style")
-        tool_layout.addWidget(self.render_preset_combo)
+        self.render_preset_combo.setMinimumWidth(105)
+        top_layout.addWidget(self.render_preset_combo)
 
-        self.clip_toggle_button = QPushButton(" Clip")
+        top_layout.addWidget(self._make_separator())
+
+        self.clip_toggle_button = QPushButton("Section Z")
         self.clip_toggle_button.setCheckable(True)
         self.clip_toggle_button.clicked.connect(self._toggle_clip_mode)
         self.clip_toggle_button.setEnabled(False)
-        self.clip_toggle_button.setToolTip("Toggle Z-axis clipping")
-        tool_layout.addWidget(self.clip_toggle_button)
+        self.clip_toggle_button.setToolTip("Toggle Z-axis cross-section clipping")
+        top_layout.addWidget(self.clip_toggle_button)
 
         self.clip_slider = QSlider(Qt.Horizontal)
         self.clip_slider.setRange(10, 90)
         self.clip_slider.setValue(50)
+        self.clip_slider.setTracking(False)
         self.clip_slider.valueChanged.connect(self._on_clip_slider_changed)
         self.clip_slider.setEnabled(False)
-        self.clip_slider.setFixedWidth(90)
-        self.clip_slider.setToolTip("Adjust clipping depth")
-        tool_layout.addWidget(self.clip_slider)
+        self.clip_slider.setFixedWidth(110)
+        self.clip_slider.setToolTip("Release slider to update Z-section depth")
+        top_layout.addWidget(self.clip_slider)
 
-        tool_layout.addWidget(self._make_separator())
+        top_layout.addStretch()
 
-        output_label = QLabel("Output:")
-        output_label.setObjectName("ToolGroupLabel")
-        tool_layout.addWidget(output_label)
-
-        self.screenshot_button = QPushButton(" Capture")
+        self.screenshot_button = QPushButton("Capture View")
         self.screenshot_button.setIcon(get_icon_from_svg(SVG_CAMERA_ICON, icon_size))
         self.screenshot_button.clicked.connect(self.capture_screenshot)
-        self.screenshot_button.setToolTip("Capture screenshot (Ctrl+Shift+C)")
-        tool_layout.addWidget(self.screenshot_button)
+        self.screenshot_button.setToolTip("Capture viewport screenshot (Ctrl+Shift+C)")
+        top_layout.addWidget(self.screenshot_button)
 
-        self.save_measurement_button = QPushButton(" Save Data")
+        # Bottom Viewport Dock: Camera navigation and Morphometric measurement tools
+        self.tool_button_container = QFrame()
+        self.tool_button_container.setObjectName("ToolButtonContainer")
+        bottom_layout = QHBoxLayout(self.tool_button_container)
+        bottom_layout.setContentsMargins(12, 8, 12, 8)
+        bottom_layout.setSpacing(10)
+
+        self.interaction_mode_group = QButtonGroup(self)
+        self.interaction_mode_group.setExclusive(True)
+
+        nav_label = QLabel("Camera")
+        nav_label.setObjectName("ToolGroupLabel")
+        bottom_layout.addWidget(nav_label)
+
+        self.rotate_button = QPushButton("Rotate")
+        self.rotate_button.setIcon(get_icon_from_svg(SVG_ROTATE_ICON, icon_size))
+        self.rotate_button.setCheckable(True)
+        self.rotate_button.setChecked(True)
+        bottom_layout.addWidget(self.rotate_button)
+        self.interaction_mode_group.addButton(self.rotate_button)
+
+        self.pan_button = QPushButton("Pan")
+        self.pan_button.setIcon(get_icon_from_svg(SVG_PAN_ICON_ALT, icon_size))
+        self.pan_button.setCheckable(True)
+        bottom_layout.addWidget(self.pan_button)
+        self.interaction_mode_group.addButton(self.pan_button)
+
+        self.zoom_button = QPushButton("Zoom")
+        self.zoom_button.setIcon(get_icon_from_svg(SVG_ZOOM_ICON, icon_size))
+        self.zoom_button.setCheckable(True)
+        bottom_layout.addWidget(self.zoom_button)
+        self.interaction_mode_group.addButton(self.zoom_button)
+
+        bottom_layout.addWidget(self._make_separator())
+
+        tools_label = QLabel("Morphometrics")
+        tools_label.setObjectName("ToolGroupLabel")
+        bottom_layout.addWidget(tools_label)
+
+        self.measure_button = QPushButton("Measure")
+        self.measure_button.setIcon(get_icon_from_svg(SVG_MEASURE_ICON, icon_size))
+        self.measure_button.setCheckable(True)
+        self.measure_button.clicked.connect(self.toggle_measurement_mode)
+        self.measure_button.setToolTip("Toggle vertex measurement mode (M)")
+        bottom_layout.addWidget(self.measure_button)
+
+        self.measure_mode_combo = QComboBox()
+        self.measure_mode_combo.addItems(["Distance", "Angle", "Polyline"])
+        self.measure_mode_combo.currentTextChanged.connect(self._on_measurement_mode_changed)
+        self.measure_mode_combo.setToolTip("Measurement mode")
+        self.measure_mode_combo.setMinimumWidth(105)
+        bottom_layout.addWidget(self.measure_mode_combo)
+
+        self.finish_measure_button = QPushButton("Finish Path")
+        self.finish_measure_button.clicked.connect(self._finish_polyline_measurement)
+        self.finish_measure_button.setEnabled(False)
+        self.finish_measure_button.setVisible(False)
+        self.finish_measure_button.setToolTip("Finish polyline measurement (Ctrl+Enter or Right-Click)")
+        bottom_layout.addWidget(self.finish_measure_button)
+
+        bottom_layout.addStretch()
+
+        self.save_measurement_button = QPushButton("Save Measurement")
         self.save_measurement_button.setIcon(get_icon_from_svg(SVG_SAVE_ICON, icon_size))
         self.save_measurement_button.clicked.connect(self.save_measurement_data)
         self.save_measurement_button.setEnabled(False)
-        self.save_measurement_button.setToolTip("Save current measurement (Ctrl+Shift+S)")
-        tool_layout.addWidget(self.save_measurement_button)
-
-        tool_layout.addStretch()
+        self.save_measurement_button.setToolTip("Save current measurement to archive (Ctrl+Shift+S)")
+        bottom_layout.addWidget(self.save_measurement_button)
 
     def _make_separator(self):
         sep = QFrame()
         sep.setFrameShape(QFrame.VLine)
-        sep.setFrameShadow(QFrame.Sunken)
+        sep.setFrameShadow(QFrame.Plain)
         sep.setObjectName("ToolSeparator")
         return sep
 
     def _init_side_panel(self):
         self.right_panel_tabs = QTabWidget()
         self.right_panel_tabs.setObjectName("RightPanelTabs")
+        self.right_panel_tabs.setMinimumWidth(370)
 
-        # Tab 1: Model Info
         self.metadata_panel = QTextEdit(self)
         self.metadata_panel.setReadOnly(True)
-        self.metadata_panel.setPlaceholderText("Load a model to see its metadata here...")
+        self.metadata_panel.setPlaceholderText("Open a 3D model to inspect geometry, bounding box, and UV mapping.")
         self.metadata_panel.setObjectName("MetadataPanel")
         self.right_panel_tabs.addTab(self.metadata_panel, "Model Info")
 
-        # Tab 2: Measurements Module
         self._build_measurement_module_tab()
-
-        # Tab 3: Screenshots Module
         self._build_screenshot_module_tab()
-
-        # Tab 4: Recent Models
         self._build_recent_models_tab()
 
     def _build_measurement_module_tab(self):
         meas_widget = QWidget()
         meas_layout = QVBoxLayout(meas_widget)
-        meas_layout.setContentsMargins(5, 5, 5, 5)
-        meas_layout.setSpacing(6)
+        meas_layout.setContentsMargins(10, 10, 10, 10)
+        meas_layout.setSpacing(8)
 
-        # Header
         header = QHBoxLayout()
         title = QLabel("Measurements")
         title.setObjectName("ArchiveTitle")
@@ -991,13 +331,12 @@ class ScanSectGUI(QMainWindow):
         header.addWidget(self.meas_open_folder_btn)
         meas_layout.addLayout(header)
 
-        # Filters
         filter_row = QHBoxLayout()
-        filter_row.addWidget(QLabel("Filter:"))
+        filter_row.setSpacing(6)
         self.meas_insect_filter = QComboBox()
         self.meas_insect_filter.addItem("All Insects")
         self.meas_insect_filter.currentTextChanged.connect(self._apply_measurement_filters)
-        filter_row.addWidget(self.meas_insect_filter)
+        filter_row.addWidget(self.meas_insect_filter, stretch=1)
 
         self.meas_sort_combo = QComboBox()
         self.meas_sort_combo.addItems([
@@ -1012,83 +351,87 @@ class ScanSectGUI(QMainWindow):
         filter_row.addWidget(self.meas_sort_combo)
         meas_layout.addLayout(filter_row)
 
-        search_row = QHBoxLayout()
-        search_row.addWidget(QLabel("Search:"))
         self.meas_search_edit = QLineEdit()
-        self.meas_search_edit.setPlaceholderText("description, model, distance, timestamp, session")
+        self.meas_search_edit.setPlaceholderText("Search measurements by note, model, value, or session...")
         self.meas_search_edit.textChanged.connect(self._apply_measurement_filters)
-        search_row.addWidget(self.meas_search_edit)
-        meas_layout.addLayout(search_row)
+        meas_layout.addWidget(self.meas_search_edit)
 
-        meas_scope_row = QHBoxLayout()
+        scope_unit_row = QHBoxLayout()
+        scope_unit_row.setSpacing(8)
         self.meas_current_model_only_chk = QCheckBox("Current Model")
         self.meas_current_model_only_chk.stateChanged.connect(self._apply_measurement_filters)
-        meas_scope_row.addWidget(self.meas_current_model_only_chk)
+        scope_unit_row.addWidget(self.meas_current_model_only_chk)
 
-        self.meas_current_session_only_chk = QCheckBox("Current Session")
+        self.meas_current_session_only_chk = QCheckBox("Session Only")
         self.meas_current_session_only_chk.stateChanged.connect(self._apply_measurement_filters)
-        meas_scope_row.addWidget(self.meas_current_session_only_chk)
-        meas_scope_row.addStretch()
-        meas_layout.addLayout(meas_scope_row)
+        scope_unit_row.addWidget(self.meas_current_session_only_chk)
+        scope_unit_row.addStretch()
 
-        unit_row = QHBoxLayout()
-        unit_row.addWidget(QLabel("Display Unit:"))
+        scope_unit_row.addWidget(QLabel("Unit:"))
         self.meas_unit_combo = QComboBox()
         self.meas_unit_combo.addItems(["mm", "cm", "um", "m"])
         self.meas_unit_combo.setCurrentText("mm")
         self.meas_unit_combo.currentTextChanged.connect(self._on_measurement_display_settings_changed)
-        unit_row.addWidget(self.meas_unit_combo)
+        scope_unit_row.addWidget(self.meas_unit_combo)
 
-        unit_row.addWidget(QLabel("Scale to mm:"))
+        scope_unit_row.addWidget(QLabel("Scale:"))
         self.meas_scale_edit = QLineEdit("1.0")
-        self.meas_scale_edit.setPlaceholderText("Model units to mm")
+        self.meas_scale_edit.setPlaceholderText("1.0")
+        self.meas_scale_edit.setToolTip("Millimeters per model unit")
         self.meas_scale_edit.editingFinished.connect(self._on_measurement_display_settings_changed)
-        self.meas_scale_edit.setMaximumWidth(90)
-        unit_row.addWidget(self.meas_scale_edit)
-        unit_row.addStretch()
-        meas_layout.addLayout(unit_row)
+        self.meas_scale_edit.setFixedWidth(58)
+        scope_unit_row.addWidget(self.meas_scale_edit)
+        meas_layout.addLayout(scope_unit_row)
 
-        self.session_measure_label = QLabel("Current Session Measurements")
-        self.session_measure_label.setObjectName("ArchiveTitle")
-        meas_layout.addWidget(self.session_measure_label)
+        session_header = QHBoxLayout()
+        self.session_measure_label = QLabel("Session Log (0)")
+        self.session_measure_label.setObjectName("ArchiveSubTitle")
+        session_header.addWidget(self.session_measure_label)
+        session_header.addStretch()
+
+        self.session_export_btn = QPushButton("Export CSV")
+        self.session_export_btn.clicked.connect(self._export_session_measurements_csv)
+        session_header.addWidget(self.session_export_btn)
+
+        self.session_clear_btn = QPushButton("Clear")
+        self.session_clear_btn.clicked.connect(self._clear_session_measurements)
+        session_header.addWidget(self.session_clear_btn)
+        meas_layout.addLayout(session_header)
 
         self.session_measure_list = QListWidget()
         self.session_measure_list.setObjectName("MeasurementListWidget")
-        self.session_measure_list.setMaximumHeight(120)
+        self.session_measure_list.setMaximumHeight(92)
+        self.session_measure_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.session_measure_list.itemSelectionChanged.connect(self._load_session_measurement)
+        self.session_measure_list.hide()
         meas_layout.addWidget(self.session_measure_list)
 
-        session_btn_row = QHBoxLayout()
-        self.session_export_btn = QPushButton("Export CSV")
-        self.session_export_btn.clicked.connect(self._export_session_measurements_csv)
-        session_btn_row.addWidget(self.session_export_btn)
+        saved_label = QLabel("Saved Archive")
+        saved_label.setObjectName("ArchiveSubTitle")
+        meas_layout.addWidget(saved_label)
 
-        self.session_clear_btn = QPushButton("Clear Session")
-        self.session_clear_btn.clicked.connect(self._clear_session_measurements)
-        session_btn_row.addWidget(self.session_clear_btn)
-        meas_layout.addLayout(session_btn_row)
-
-        # List
         self.measurement_list = QListWidget()
         self.measurement_list.setObjectName("MeasurementListWidget")
-        self.measurement_list.setIconSize(QSize(60, 60))
-        self.measurement_list.setSpacing(3)
+        self.measurement_list.setIconSize(QSize(56, 56))
+        self.measurement_list.setSpacing(4)
+        self.measurement_list.setWordWrap(True)
+        self.measurement_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.measurement_list.itemSelectionChanged.connect(self._on_measurement_selection_changed)
         self.measurement_list.itemDoubleClicked.connect(self._on_measurement_double_clicked)
-        meas_layout.addWidget(self.measurement_list)
+        meas_layout.addWidget(self.measurement_list, stretch=1)
 
-        self.measurement_empty_label = QLabel("No measurements found. Create one in Measure mode or adjust filters.")
+        self.measurement_empty_label = QLabel("No saved measurements match the active filters.")
         self.measurement_empty_label.setObjectName("EmptyStateLabel")
         self.measurement_empty_label.setAlignment(Qt.AlignCenter)
+        self.measurement_empty_label.setWordWrap(True)
         self.measurement_empty_label.hide()
         meas_layout.addWidget(self.measurement_empty_label)
 
-        # Detail inspector
         self.measurement_detail = MeasurementDetailWidget()
         meas_layout.addWidget(self.measurement_detail)
 
-        # Buttons
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
         self.meas_load_btn = QPushButton("Load to Viewport")
         self.meas_load_btn.setIcon(get_icon_from_svg(SVG_MEASURE_ICON, QSize(16, 16)))
         self.meas_load_btn.clicked.connect(self._load_measurement_from_module)
@@ -1106,15 +449,18 @@ class ScanSectGUI(QMainWindow):
         btn_row.addWidget(self.meas_delete_btn)
         meas_layout.addLayout(btn_row)
 
-        self.right_panel_tabs.addTab(meas_widget, "\U0001F4CF Measurements")
+        self.right_panel_tabs.addTab(
+            meas_widget,
+            get_icon_from_svg(SVG_MEASURE_ICON, QSize(14, 14)),
+            "Measurements",
+        )
 
     def _build_screenshot_module_tab(self):
         ss_widget = QWidget()
         ss_layout = QVBoxLayout(ss_widget)
-        ss_layout.setContentsMargins(5, 5, 5, 5)
-        ss_layout.setSpacing(6)
+        ss_layout.setContentsMargins(10, 10, 10, 10)
+        ss_layout.setSpacing(8)
 
-        # Header
         header = QHBoxLayout()
         title = QLabel("Screenshots")
         title.setObjectName("ArchiveTitle")
@@ -1127,24 +473,22 @@ class ScanSectGUI(QMainWindow):
         header.addWidget(self.ss_open_folder_btn)
         ss_layout.addLayout(header)
 
-        # Filters
         filter_row = QHBoxLayout()
-        filter_row.addWidget(QLabel("Filter:"))
+        filter_row.setSpacing(6)
+        filter_row.addWidget(QLabel("Specimen:"))
         self.ss_insect_filter = QComboBox()
         self.ss_insect_filter.addItem("All Insects")
         self.ss_insect_filter.currentTextChanged.connect(self._apply_screenshot_filters)
-        filter_row.addWidget(self.ss_insect_filter)
+        filter_row.addWidget(self.ss_insect_filter, stretch=1)
         ss_layout.addLayout(filter_row)
 
-        search_row = QHBoxLayout()
-        search_row.addWidget(QLabel("Search:"))
         self.ss_search_edit = QLineEdit()
-        self.ss_search_edit.setPlaceholderText("description, model, timestamp, session, filename")
+        self.ss_search_edit.setPlaceholderText("Search screenshots by note, model, date, or filename...")
         self.ss_search_edit.textChanged.connect(self._apply_screenshot_filters)
-        search_row.addWidget(self.ss_search_edit)
-        ss_layout.addLayout(search_row)
+        ss_layout.addWidget(self.ss_search_edit)
 
         ss_scope_row = QHBoxLayout()
+        ss_scope_row.setSpacing(10)
         self.ss_current_model_only_chk = QCheckBox("Current Model")
         self.ss_current_model_only_chk.stateChanged.connect(self._apply_screenshot_filters)
         ss_scope_row.addWidget(self.ss_current_model_only_chk)
@@ -1155,23 +499,25 @@ class ScanSectGUI(QMainWindow):
         ss_scope_row.addStretch()
         ss_layout.addLayout(ss_scope_row)
 
-        # List with thumbnails
         self.screenshot_list = QListWidget()
         self.screenshot_list.setObjectName("ScreenshotListWidget")
-        self.screenshot_list.setIconSize(QSize(100, 100))
+        self.screenshot_list.setIconSize(QSize(88, 88))
         self.screenshot_list.setSpacing(4)
+        self.screenshot_list.setWordWrap(True)
+        self.screenshot_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.screenshot_list.itemSelectionChanged.connect(self._on_screenshot_selection_changed)
         self.screenshot_list.itemDoubleClicked.connect(self._preview_screenshot)
-        ss_layout.addWidget(self.screenshot_list)
+        ss_layout.addWidget(self.screenshot_list, stretch=1)
 
-        self.screenshot_empty_label = QLabel("No screenshots found. Capture one or adjust filters.")
+        self.screenshot_empty_label = QLabel("No saved screenshots match the active filters.")
         self.screenshot_empty_label.setObjectName("EmptyStateLabel")
         self.screenshot_empty_label.setAlignment(Qt.AlignCenter)
+        self.screenshot_empty_label.setWordWrap(True)
         self.screenshot_empty_label.hide()
         ss_layout.addWidget(self.screenshot_empty_label)
 
-        # Buttons
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
         self.ss_preview_btn = QPushButton("Preview")
         self.ss_preview_btn.clicked.connect(self._preview_selected_screenshot)
         self.ss_preview_btn.setEnabled(False)
@@ -1188,12 +534,16 @@ class ScanSectGUI(QMainWindow):
         btn_row.addWidget(self.ss_delete_btn)
         ss_layout.addLayout(btn_row)
 
-        self.right_panel_tabs.addTab(ss_widget, "\U0001F4F7 Screenshots")
+        self.right_panel_tabs.addTab(
+            ss_widget,
+            get_icon_from_svg(SVG_CAMERA_ICON, QSize(14, 14)),
+            "Screenshots",
+        )
 
     def _build_recent_models_tab(self):
         recent_widget = QWidget()
         recent_layout = QVBoxLayout(recent_widget)
-        recent_layout.setContentsMargins(5, 5, 5, 5)
+        recent_layout.setContentsMargins(10, 10, 10, 10)
         recent_layout.setSpacing(8)
 
         header = QHBoxLayout()
@@ -1208,11 +558,15 @@ class ScanSectGUI(QMainWindow):
 
         self.recent_models_list = QListWidget()
         self.recent_models_list.setObjectName("ArchiveList")
+        self.recent_models_list.setSpacing(4)
+        self.recent_models_list.setWordWrap(True)
+        self.recent_models_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.recent_models_list.itemDoubleClicked.connect(self._load_recent_model)
         self.recent_models_list.itemSelectionChanged.connect(self._on_recent_selection_changed)
-        recent_layout.addWidget(self.recent_models_list)
+        recent_layout.addWidget(self.recent_models_list, stretch=1)
 
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
         self.load_recent_button = QPushButton("Load Selected")
         self.load_recent_button.clicked.connect(lambda: self._load_recent_model(self.recent_models_list.currentItem()))
         self.load_recent_button.setEnabled(False)
@@ -1223,7 +577,7 @@ class ScanSectGUI(QMainWindow):
         btn_row.addWidget(self.remove_recent_button)
         recent_layout.addLayout(btn_row)
 
-        self.right_panel_tabs.addTab(recent_widget, "Recent Models")
+        self.right_panel_tabs.addTab(recent_widget, "Recent")
 
     def _init_layout(self):
         self.central_widget = QWidget(self)
@@ -1235,38 +589,18 @@ class ScanSectGUI(QMainWindow):
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(5)
+        left_layout.setSpacing(8)
+        left_layout.addWidget(self.top_viewport_bar)
         left_layout.addWidget(self._viewport_container, stretch=1)
-
-        self.quick_actions_bar = QFrame()
-        self.quick_actions_bar.setObjectName("QuickActionsBar")
-        quick_layout = QHBoxLayout(self.quick_actions_bar)
-        quick_layout.setContentsMargins(8, 6, 8, 6)
-        quick_layout.setSpacing(8)
-
-        self.qa_open_btn = QPushButton("Open")
-        self.qa_open_btn.clicked.connect(self.open_model_dialog)
-        quick_layout.addWidget(self.qa_open_btn)
-
-        self.qa_measure_btn = QPushButton("Measure")
-        self.qa_measure_btn.clicked.connect(self.measure_button.click)
-        quick_layout.addWidget(self.qa_measure_btn)
-
-        self.qa_capture_btn = QPushButton("Capture")
-        self.qa_capture_btn.clicked.connect(self.capture_screenshot)
-        quick_layout.addWidget(self.qa_capture_btn)
-
-        self.qa_save_btn = QPushButton("Save")
-        self.qa_save_btn.clicked.connect(self.save_measurement_data)
-        quick_layout.addWidget(self.qa_save_btn)
-
-        quick_layout.addStretch()
-        left_layout.addWidget(self.quick_actions_bar)
+        left_layout.addWidget(self.measurement_display)
 
         self.inline_alert_label = QLabel("")
         self.inline_alert_label.setObjectName("InlineAlert")
         self.inline_alert_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.inline_alert_label.hide()
+        self._inline_alert_timer = QTimer(self)
+        self._inline_alert_timer.setSingleShot(True)
+        self._inline_alert_timer.timeout.connect(self.inline_alert_label.hide)
         left_layout.addWidget(self.inline_alert_label)
 
         left_layout.addWidget(self.tool_button_container)
@@ -1276,27 +610,28 @@ class ScanSectGUI(QMainWindow):
         self.splitter.addWidget(self.right_panel_tabs)
         self.splitter.setStretchFactor(0, 3)
         self.splitter.setStretchFactor(1, 1)
-        self.splitter.setHandleWidth(6)
+        self.splitter.setSizes([1030, 400])
+        self.splitter.setHandleWidth(8)
         self.splitter.setStyleSheet("""
-            QSplitter::handle { background-color: #444444; border-radius: 2px; }
-            QSplitter::handle:hover { background-color: #007acc; }
+            QSplitter::handle { background-color: #262b36; border-radius: 2px; margin: 0 2px; }
+            QSplitter::handle:hover { background-color: #38bdf8; }
         """)
         self.main_layout.addWidget(self.splitter)
 
     def _show_inline_alert(self, message, level="info", timeout_ms=4000):
         level_styles = {
-            "info": "background-color: #17324d; border-color: #2d8cf0; color: #d9ecff;",
-            "success": "background-color: #173d2a; border-color: #33b56a; color: #dcfce7;",
-            "warning": "background-color: #4b3313; border-color: #d9922b; color: #fdecc8;",
-            "error": "background-color: #4a1f24; border-color: #e05d6f; color: #ffe2e7;",
+            "info": "background-color: #162a3d; border-color: #38bdf8; color: #e0f2fe;",
+            "success": "background-color: #143326; border-color: #34d399; color: #d1fae5;",
+            "warning": "background-color: #3b2a14; border-color: #fbbf24; color: #fef3c7;",
+            "error": "background-color: #3f1d24; border-color: #f87171; color: #fee2e2;",
         }
         style = level_styles.get(level, level_styles["info"])
         self.inline_alert_label.setStyleSheet(
-            f"border: 1px solid; border-radius: 5px; padding: 6px 10px; font-size: 9pt; {style}"
+            f"border: 1px solid; border-radius: 4px; padding: 6px 10px; font-size: 9pt; {style}"
         )
         self.inline_alert_label.setText(message)
         self.inline_alert_label.show()
-        QTimer.singleShot(timeout_ms, self.inline_alert_label.hide)
+        self._inline_alert_timer.start(timeout_ms)
 
     def _on_toggle_high_contrast(self, enabled):
         self.high_contrast_enabled = bool(enabled)
@@ -1307,7 +642,7 @@ class ScanSectGUI(QMainWindow):
     def _init_menus(self):
         menu_bar = self.menuBar()
         file_menu = menu_bar.addMenu("&File")
-        open_action = QAction(get_icon_from_svg(SVG_OPEN_FILE_ICON, QSize(16, 16)), "&Open Model/Texture...", self)
+        open_action = QAction(get_icon_from_svg(SVG_OPEN_FILE_ICON, QSize(16, 16)), "&Open Model or Texture...", self)
         open_action.setShortcut(QKeySequence.Open)
         open_action.triggered.connect(self.open_model_dialog)
         file_menu.addAction(open_action)
@@ -1336,7 +671,6 @@ class ScanSectGUI(QMainWindow):
         self.shortcut_finish_polyline = QShortcut(QKeySequence("Ctrl+Enter"), self)
         self.shortcut_finish_polyline.activated.connect(self._finish_polyline_measurement)
 
-        # Ctrl+O already exists in File menu; provide an additional explicit accelerator.
         self.shortcut_open_model = QShortcut(QKeySequence("Ctrl+Shift+O"), self)
         self.shortcut_open_model.activated.connect(self.open_model_dialog)
 
@@ -1351,10 +685,9 @@ class ScanSectGUI(QMainWindow):
     def _init_status_bar(self):
         self.status_bar = QStatusBar(self)
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready. Left-Click: Rotate. Open a 3D model to begin. Shortcuts: M, Ctrl+Shift+C, Ctrl+Shift+S, Ctrl+O, Ctrl+Enter")
-
-    def _unit_multiplier_from_mm(self, unit_name):
-        return unit_multiplier_from_mm(unit_name)
+        self.status_bar.showMessage(
+            "Ready. Left-click: Rotate | Shortcuts: Ctrl+O (Open), M (Measure), Ctrl+Shift+C (Capture), Ctrl+Shift+S (Save)"
+        )
 
     def _format_distance_from_mm(self, value_mm, decimals=2):
         return format_distance_from_mm(value_mm, self.measurement_unit, decimals)
@@ -1388,7 +721,7 @@ class ScanSectGUI(QMainWindow):
             return 0.0
 
         unit = parts[1].lower() if len(parts) > 1 else 'mm'
-        multiplier = self._unit_multiplier_from_mm(unit)
+        multiplier = unit_multiplier_from_mm(unit)
         if multiplier <= 0:
             return value
         return value / multiplier
@@ -1427,7 +760,7 @@ class ScanSectGUI(QMainWindow):
             return "Shift+LeftClick two vertices to measure distance."
         if mode == 'angle':
             return "Shift+LeftClick three vertices (middle point is angle vertex)."
-        return "Shift+LeftClick points to build polyline, then click Finish (Ctrl+Enter)."
+        return "Shift+LeftClick points to build polyline, then click Finish Path (Ctrl+Enter or Right-Click)."
 
     def _measurement_step_text(self):
         mode = self.measurement_mode.lower()
@@ -1438,16 +771,17 @@ class ScanSectGUI(QMainWindow):
             return f"Step {min(count + 1, 3)}/3" if count < 3 else "Ready to save"
         if count < 2:
             return "Step 1/2"
-        return f"Points: {count} (finish to save)"
+        return f"{count} pts (Right-Click to finish)"
 
     def _update_measure_ui_hints(self):
         is_polyline = self.measurement_mode.lower() == 'polyline'
+        self.finish_measure_button.setVisible(is_polyline)
         self.finish_measure_button.setEnabled(self.is_measuring and is_polyline and len(self._measurement_pick_points) >= 2)
         if self.is_measuring:
             self.status_bar.showMessage(f"Measurement mode [{self.measurement_mode}]: {self._measurement_mode_label()}")
             self.measurement_display.update_context(self.measurement_mode, self._measurement_step_text())
-            self.measurement_display._distance_label.setText("Awaiting points")
-            self.measurement_display._coords_label.setText("")
+            self.measurement_display._distance_label.setText("Select vertices...")
+            self.measurement_display._coords_label.setText("Hold Shift + Left-Click on mesh surface")
             self._position_measurement_display()
 
     def _on_measurement_mode_changed(self, mode_text):
@@ -1455,6 +789,7 @@ class ScanSectGUI(QMainWindow):
         self._measurement_pick_points = []
         self.current_measurement = {}
         self._clear_measurement_visuals()
+        self.finish_measure_button.setVisible(self.measurement_mode.lower() == 'polyline')
         if self.is_measuring:
             self._update_measure_ui_hints()
         else:
@@ -1462,50 +797,46 @@ class ScanSectGUI(QMainWindow):
         self.save_measurement_button.setEnabled(False)
 
     def _record_session_measurement(self, measurement_entry):
-        self.session_measurements.append(dict(measurement_entry))
+        entry = dict(measurement_entry)
+        entry.setdefault('scale_to_mm', self.scale_to_mm)
+        entry.setdefault('unit', self.measurement_unit)
+        self.session_measurements.append(entry)
         self._refresh_session_measurement_list()
 
     def _refresh_session_measurement_list(self):
         self.session_measure_list.clear()
+        count = len(self.session_measurements)
+        self.session_measure_label.setText(f"Session Log ({count})")
         for idx, item in enumerate(self.session_measurements, start=1):
             label = self._measurement_display_text(item)
             m_type = str(item.get('measurement_type', 'distance')).capitalize()
             li = QListWidgetItem(f"#{idx} {m_type}: {label}")
             li.setData(Qt.UserRole, item)
             self.session_measure_list.addItem(li)
+        self.session_measure_list.setVisible(count > 0)
+
+    def _restore_measurement_scale_and_unit(self, data):
+        saved_scale = data.get('scale_to_mm')
+        if saved_scale is not None:
+            try:
+                scale_val = float(saved_scale)
+                if scale_val > 0:
+                    self.scale_to_mm = scale_val
+                    self.meas_scale_edit.setText(f"{self.scale_to_mm:.6g}")
+            except (TypeError, ValueError):
+                pass
+        saved_unit = data.get('unit')
+        if saved_unit and self.meas_unit_combo.findText(str(saved_unit)) >= 0:
+            self.measurement_unit = str(saved_unit)
+            self.meas_unit_combo.blockSignals(True)
+            self.meas_unit_combo.setCurrentText(self.measurement_unit)
+            self.meas_unit_combo.blockSignals(False)
 
     def _load_session_measurement(self):
         selected = self.session_measure_list.selectedItems()
         if not selected:
             return
-
-        if not self.is_measuring:
-            self.measure_button.setChecked(True)
-            self.toggle_measurement_mode()
-            if not self.is_measuring:
-                return
-
-        data = selected[0].data(Qt.UserRole)
-        points = data.get('points')
-        if not points:
-            p1 = data.get('point1')
-            p2 = data.get('point2')
-            if p1 and p2:
-                points = [p1, p2]
-
-        if not points:
-            return
-
-        self._measurement_pick_points = [[float(v) for v in p] for p in points]
-        self._draw_measurement_visuals()
-        self.measurement_mode = str(data.get('measurement_type', self.measurement_mode)).capitalize()
-        self.measure_mode_combo.blockSignals(True)
-        if self.measure_mode_combo.findText(self.measurement_mode) >= 0:
-            self.measure_mode_combo.setCurrentText(self.measurement_mode)
-        self.measure_mode_combo.blockSignals(False)
-        self._finalize_measurement_from_points(record_history=False)
-        self.save_measurement_button.setEnabled(True)
-        self._update_measure_ui_hints()
+        self._apply_measurement_data_to_viewport(selected[0].data(Qt.UserRole), switch_tab=False)
 
     def _clear_session_measurements(self):
         self.session_measurements = []
@@ -1609,7 +940,7 @@ class ScanSectGUI(QMainWindow):
             self.mesh_mgr.current_actor = self.plotter.add_mesh(
                 display_mesh,
                 style='wireframe',
-                color='#00bcd4',
+                color='#0284c7',
                 line_width=1.2,
                 lighting=False,
             )
@@ -1670,9 +1001,9 @@ class ScanSectGUI(QMainWindow):
         self._apply_render_to_current_mesh(reset_camera=False)
 
         if self.clip_enabled:
-            self.status_bar.showMessage("Clipping enabled. Adjust the slider to change depth.")
+            self.status_bar.showMessage("Z-clipping enabled. Release the slider to update slice depth.")
         else:
-            self.status_bar.showMessage("Clipping disabled.")
+            self.status_bar.showMessage("Z-clipping disabled.")
 
     def _on_clip_slider_changed(self, slider_value):
         self.clip_ratio = max(0.1, min(0.9, slider_value / 100.0))
@@ -1680,220 +1011,314 @@ class ScanSectGUI(QMainWindow):
             self._apply_render_to_current_mesh(reset_camera=False)
 
     def _run_archive_integrity_check(self):
-        removed_screenshots = 0
-        removed_measurements = 0
-        fixed_thumbnails = 0
-        changed_screenshots = False
-        changed_measurements = False
+        def _clean_entries(entries):
+            valid, removed, fixed_thumbs = [], 0, 0
+            for entry in entries:
+                file_path = entry.get('file_path')
+                if not file_path or not os.path.exists(file_path):
+                    removed += 1
+                    continue
+                updated = dict(entry)
+                thumb_path = updated.get('thumbnail_path')
+                if thumb_path and not os.path.exists(thumb_path):
+                    updated['thumbnail_path'] = None
+                    fixed_thumbs += 1
+                valid.append(updated)
+            return valid, removed, fixed_thumbs
 
-        valid_screenshots = []
-        for entry in self.archive_mgr.screenshots:
-            file_path = entry.get('file_path')
-            if not file_path or not os.path.exists(file_path):
-                removed_screenshots += 1
-                changed_screenshots = True
-                continue
+        valid_ss, rem_ss, fix_ss = _clean_entries(self.archive_mgr.screenshots)
+        valid_meas, rem_meas, fix_meas = _clean_entries(self.archive_mgr.measurements)
 
-            updated = dict(entry)
-            thumb_path = updated.get('thumbnail_path')
-            if thumb_path and not os.path.exists(thumb_path):
-                updated['thumbnail_path'] = None
-                fixed_thumbnails += 1
-                changed_screenshots = True
-
-            valid_screenshots.append(updated)
-
-        valid_measurements = []
-        for entry in self.archive_mgr.measurements:
-            file_path = entry.get('file_path')
-            if not file_path or not os.path.exists(file_path):
-                removed_measurements += 1
-                changed_measurements = True
-                continue
-
-            updated = dict(entry)
-            thumb_path = updated.get('thumbnail_path')
-            if thumb_path and not os.path.exists(thumb_path):
-                updated['thumbnail_path'] = None
-                fixed_thumbnails += 1
-                changed_measurements = True
-
-            valid_measurements.append(updated)
-
-        if changed_screenshots:
-            self.archive_mgr.screenshots = valid_screenshots
+        if rem_ss > 0 or fix_ss > 0:
+            self.archive_mgr.screenshots = valid_ss
             self.archive_mgr.save_screenshots()
-
-        if changed_measurements:
-            self.archive_mgr.measurements = valid_measurements
+        if rem_meas > 0 or fix_meas > 0:
+            self.archive_mgr.measurements = valid_meas
             self.archive_mgr.save_measurements()
 
-        total_removed = removed_screenshots + removed_measurements
+        total_removed = rem_ss + rem_meas
+        fixed_thumbnails = fix_ss + fix_meas
         if total_removed > 0 or fixed_thumbnails > 0:
             self.status_bar.showMessage(
-                f"Archive integrity check: removed {total_removed} missing entries, fixed {fixed_thumbnails} thumbnails."
+                f"Archive check: removed {total_removed} missing entries, repaired {fixed_thumbnails} thumbnail links."
             )
 
     def _apply_stylesheet(self):
+        """Precision lab instrument dark theme:
+        - Base surface: #16181d, raised panel: #1e222a, control surface: #262b36
+        - Primary text: #f1f5f9 (contrast ~16.2:1), secondary text: #94a3b8 (contrast ~6.2:1 >= 4.5:1)
+        - Single active/focus accent: #0369a1 / #38bdf8
+        """
         base_stylesheet = """
-            QMainWindow { background-color: #1e1e1e; }
-            QWidget { font-family: 'Segoe UI', Arial, sans-serif; font-size: 10pt; color: #efefef; }
+            QMainWindow { background-color: #16181d; }
+            QWidget {
+                font-family: 'Segoe UI', Arial, sans-serif;
+                font-size: 9.5pt;
+                color: #f1f5f9;
+            }
             QTextEdit#MetadataPanel {
-                background-color: #2c2c2c; color: #ebebeb;
-                border: 1px solid #444444; border-radius: 6px;
-                padding: 10px; font-size: 10pt;
+                background-color: #16181d;
+                color: #e2e8f0;
+                border: 1px solid #2e3440;
+                border-radius: 4px;
+                padding: 12px;
+                font-family: 'Consolas', 'Cascadia Mono', 'Segoe UI', monospace;
+                font-size: 9.5pt;
+            }
+            QFrame#TopViewportBar, QFrame#ToolButtonContainer {
+                background-color: #1e222a;
+                border: 1px solid #2e3440;
+                border-radius: 4px;
             }
             QPushButton {
-                background-color: #333333; color: #f2f2f2;
-                border: 1px solid #555555; border-radius: 5px;
-                padding: 6px 14px; min-height: 24px; icon-size: 16px;
+                background-color: #262b36;
+                color: #f1f5f9;
+                border: 1px solid #384152;
+                border-radius: 4px;
+                padding: 6px 13px;
+                min-height: 24px;
+                icon-size: 16px;
             }
-            QPushButton:hover { background-color: #3e3e3e; border-color: #007acc; }
-            QPushButton:pressed { background-color: #222222; }
-            QPushButton:checked { background-color: #007acc; color: #ffffff; border: 1px solid #005c99; font-weight: bold; }
-            QPushButton:disabled { background-color: #2a2a2a; color: #666666; border-color: #3a3a3a; }
-            QPushButton:focus { border: 2px solid #36a3ff; }
-            QStatusBar { font-size: 9pt; color: #c0c0c0; background-color: #252525; border-top: 1px solid #333; }
-            QMenuBar { background-color: #2b2b2b; color: #e0e0e0; }
-            QMenuBar::item { background-color: transparent; padding: 4px 8px; }
-            QMenuBar::item:selected { background-color: #007acc; color: #ffffff; border-radius: 3px; }
-            QMenu { background-color: #333333; color: #e0e0e0; border: 1px solid #555555; border-radius: 4px; }
-            QMenu::item { padding: 4px 20px; }
-            QMenu::item:selected { background-color: #007acc; color: #ffffff; }
-            QMenu::separator { height: 1px; background: #555555; margin-left: 5px; margin-right: 5px; }
-            QLabel#ToolGroupLabel { color: #888888; font-size: 9pt; font-weight: bold; margin: 0px 5px; }
-            QFrame#ToolSeparator { color: #555555; }
-            QTabWidget#RightPanelTabs { background-color: #1e1e1e; border: none; }
-            QTabWidget::pane { border: 1px solid #444444; background-color: #2c2c2c; border-radius: 6px; }
+            QPushButton:hover {
+                background-color: #303746;
+                border-color: #38bdf8;
+            }
+            QPushButton:pressed {
+                background-color: #1b2028;
+            }
+            QPushButton:checked {
+                background-color: #0369a1;
+                color: #ffffff;
+                border: 1px solid #38bdf8;
+                font-weight: 600;
+            }
+            QPushButton:disabled {
+                background-color: #1b1f27;
+                color: #64748b;
+                border-color: #262b36;
+            }
+            QPushButton:focus {
+                border: 1px solid #38bdf8;
+            }
+            QStatusBar {
+                font-size: 9pt;
+                color: #cbd5e1;
+                background-color: #121418;
+                border-top: 1px solid #262b36;
+            }
+            QMenuBar {
+                background-color: #16181d;
+                color: #e2e8f0;
+                border-bottom: 1px solid #262b36;
+            }
+            QMenuBar::item {
+                background-color: transparent;
+                padding: 5px 10px;
+            }
+            QMenuBar::item:selected {
+                background-color: #262b36;
+                color: #ffffff;
+                border-radius: 3px;
+            }
+            QMenu {
+                background-color: #1e222a;
+                color: #f1f5f9;
+                border: 1px solid #384152;
+                border-radius: 4px;
+            }
+            QMenu::item {
+                padding: 5px 22px;
+            }
+            QMenu::item:selected {
+                background-color: #0369a1;
+                color: #ffffff;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #2e3440;
+                margin: 4px 6px;
+            }
+            QLabel#ToolGroupLabel {
+                color: #94a3b8;
+                font-size: 9pt;
+                font-weight: 600;
+                margin: 0px 4px;
+            }
+            QFrame#ToolSeparator {
+                color: #333b4a;
+                background-color: #333b4a;
+                max-width: 1px;
+                margin: 3px 6px;
+            }
+            QTabWidget#RightPanelTabs {
+                background-color: #16181d;
+                border: none;
+            }
+            QTabWidget::pane {
+                border: 1px solid #2e3440;
+                background-color: #1e222a;
+                border-radius: 4px;
+            }
             QTabBar::tab {
-                background-color: #2c2c2c; color: #a0a0a0;
-                border: 1px solid #444444; border-bottom: none;
-                border-top-left-radius: 6px; border-top-right-radius: 6px;
-                padding: 7px 14px; margin-right: 2px;
+                background-color: #16181d;
+                color: #94a3b8;
+                border: 1px solid #2e3440;
+                border-bottom: none;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+                padding: 7px 13px;
+                margin-right: 2px;
             }
-            QTabBar::tab:selected { background-color: #007acc; color: #ffffff; font-weight: bold; }
-            QTabBar::tab:hover:!selected { background-color: #3c3c3c; color: #d0d0d0; }
-            QLabel#ArchiveTitle { font-size: 11pt; font-weight: bold; color: #e0e0e0; }
-            QComboBox {
-                background-color: #333333; color: #e0e0e0;
-                border: 1px solid #555555; border-radius: 4px; padding: 4px 8px;
+            QTabBar::tab:selected {
+                background-color: #1e222a;
+                color: #f8fafc;
+                border-top: 2px solid #38bdf8;
+                font-weight: 600;
             }
-            QComboBox:hover { border-color: #007acc; }
-            QComboBox:focus { border: 2px solid #36a3ff; }
+            QTabBar::tab:hover:!selected {
+                background-color: #222731;
+                color: #e2e8f0;
+            }
+            QLabel#ArchiveTitle {
+                font-size: 10.5pt;
+                font-weight: 600;
+                color: #f8fafc;
+            }
+            QLabel#ArchiveSubTitle {
+                font-size: 9pt;
+                font-weight: 600;
+                color: #94a3b8;
+                margin-top: 2px;
+            }
+            QLabel#PreviewDialogInfo {
+                color: #94a3b8;
+                font-size: 8.5pt;
+                padding-top: 2px;
+            }
+            QComboBox, QLineEdit {
+                background-color: #262b36;
+                color: #f1f5f9;
+                border: 1px solid #384152;
+                border-radius: 4px;
+                padding: 5px 9px;
+                min-height: 22px;
+            }
+            QComboBox:hover, QLineEdit:hover {
+                border-color: #64748b;
+            }
+            QComboBox:focus, QLineEdit:focus, QListWidget:focus {
+                border: 1px solid #38bdf8;
+            }
             QComboBox QAbstractItemView {
-                background-color: #333333; color: #e0e0e0;
-                border: 1px solid #555555; selection-background-color: #007acc;
+                background-color: #1e222a;
+                color: #f1f5f9;
+                border: 1px solid #384152;
+                selection-background-color: #0369a1;
             }
-            QLineEdit {
-                background-color: #333333; color: #e0e0e0;
-                border: 1px solid #555555; border-radius: 4px; padding: 4px 8px;
+            QCheckBox {
+                color: #cbd5e1;
+                spacing: 6px;
             }
-            QLineEdit:focus { border: 2px solid #36a3ff; }
-            QListWidget:focus { border: 2px solid #36a3ff; }
-
             QLabel#EmptyStateLabel {
-                background-color: #232f39;
-                border: 1px dashed #4f7186;
-                border-radius: 6px;
-                color: #d8eaf7;
-                font-size: 10pt;
-                padding: 12px;
+                background-color: #16181d;
+                border: 1px solid #2e3440;
+                border-radius: 4px;
+                color: #94a3b8;
+                font-size: 9.5pt;
+                padding: 16px;
             }
-
             QLabel#InlineAlert {
-                border-radius: 5px;
+                border-radius: 4px;
                 font-size: 9pt;
                 padding: 6px 10px;
             }
-
-            QFrame#QuickActionsBar {
-                background-color: #212b33;
-                border: 1px solid #3a5566;
-                border-radius: 6px;
+            QListWidget#MeasurementListWidget,
+            QListWidget#ScreenshotListWidget,
+            QListWidget#ArchiveList {
+                background-color: #16181d;
+                color: #e2e8f0;
+                border: 1px solid #2e3440;
+                border-radius: 4px;
+                padding: 6px;
+                font-size: 9pt;
             }
-
-            /* --- Measurement Module Styling --- */
-            QListWidget#MeasurementListWidget {
-                background-color: #252525; color: #d0d0d0;
-                border: 1px solid #444444; border-radius: 6px;
-                padding: 4px; font-size: 9pt;
-            }
-            QListWidget#MeasurementListWidget::item {
-                padding: 8px; border-bottom: 1px solid #333;
-                border-left: 3px solid #4fc3f7; border-radius: 3px;
+            QListWidget#MeasurementListWidget::item,
+            QListWidget#ScreenshotListWidget::item,
+            QListWidget#ArchiveList::item {
+                padding: 9px 10px;
+                border-bottom: 1px solid #222731;
+                border-left: 3px solid transparent;
+                border-radius: 2px;
                 margin-bottom: 2px;
             }
-            QListWidget#MeasurementListWidget::item:selected {
-                background-color: #1a3a4e; color: #ffffff; border-left: 3px solid #00bcd4;
+            QListWidget#MeasurementListWidget::item:selected,
+            QListWidget#ScreenshotListWidget::item:selected,
+            QListWidget#ArchiveList::item:selected {
+                background-color: #172a3a;
+                color: #ffffff;
+                border-left: 3px solid #38bdf8;
             }
-            QListWidget#MeasurementListWidget::item:hover {
-                background-color: #2a3a45;
+            QListWidget#MeasurementListWidget::item:hover:!selected,
+            QListWidget#ScreenshotListWidget::item:hover:!selected,
+            QListWidget#ArchiveList::item:hover:!selected {
+                background-color: #1e2430;
             }
-
-            /* --- Screenshot Module Styling --- */
-            QListWidget#ScreenshotListWidget {
-                background-color: #252525; color: #d0d0d0;
-                border: 1px solid #444444; border-radius: 6px;
-                padding: 4px; font-size: 9pt;
-            }
-            QListWidget#ScreenshotListWidget::item {
-                padding: 8px; border-bottom: 1px solid #333; border-radius: 3px;
-            }
-            QListWidget#ScreenshotListWidget::item:selected {
-                background-color: #007acc; color: #ffffff;
-            }
-            QListWidget#ScreenshotListWidget::item:hover { background-color: #353535; }
-
-            /* --- Recent Models List --- */
-            QListWidget#ArchiveList {
-                background-color: #252525; color: #d0d0d0;
-                border: 1px solid #444444; border-radius: 6px;
-                padding: 4px; font-size: 9pt;
-            }
-            QListWidget#ArchiveList::item { padding: 8px; border-bottom: 1px solid #333; border-radius: 3px; }
-            QListWidget#ArchiveList::item:selected { background-color: #007acc; color: #ffffff; }
-            QListWidget#ArchiveList::item:hover { background-color: #353535; }
-
-            /* --- Measurement Overlay (viewport) --- */
             QFrame#MeasurementDisplay {
-                background-color: rgba(20, 30, 40, 220);
-                border: 2px solid #4fc3f7;
-                border-radius: 8px;
+                background-color: #16181d;
+                border: 1px solid #38bdf8;
+                border-radius: 4px;
             }
             QLabel#MeasurementTitle {
-                color: #4fc3f7; font-size: 9pt; font-weight: bold;
-                letter-spacing: 2px; background: transparent;
-            }
-            QLabel#MeasurementModeBadge {
-                color: #d3ecff; background-color: rgba(79, 195, 247, 0.25);
-                border: 1px solid #4fc3f7; border-radius: 4px;
-                padding: 2px 6px; font-size: 8pt; font-weight: bold;
-            }
-            QLabel#MeasurementValue {
-                color: #ffffff; font-size: 18pt; font-weight: bold;
+                color: #f8fafc;
+                font-size: 9.5pt;
+                font-weight: 600;
                 background: transparent;
             }
+            QLabel#MeasurementModeBadge {
+                color: #38bdf8;
+                background: transparent;
+                font-size: 9.5pt;
+                font-weight: 600;
+            }
+            QLabel#MeasurementValue {
+                color: #ffffff;
+                font-family: 'Consolas', 'Cascadia Mono', 'Segoe UI', monospace;
+                font-size: 13pt;
+                font-weight: bold;
+                background: transparent;
+                padding: 0px 4px;
+            }
             QLabel#MeasurementCoords {
-                color: #90a4ae; font-size: 8pt; background: transparent;
+                color: #cbd5e1;
+                font-family: 'Consolas', 'Cascadia Mono', 'Segoe UI', monospace;
+                font-size: 9pt;
+                background: transparent;
             }
             QLabel#MeasurementStep {
-                color: #b7d8ea; font-size: 8pt; background: transparent;
+                color: #94a3b8;
+                font-size: 9pt;
+                background: transparent;
             }
-
-            /* --- Measurement Detail Inspector --- */
             QFrame#MeasurementDetail {
-                background-color: #1e2a30; border: 1px solid #37474f;
-                border-radius: 6px;
+                background-color: #16181d;
+                border: 1px solid #2e3440;
+                border-radius: 4px;
             }
             QLabel#MeasurementDetailHeader {
-                color: #4fc3f7; font-size: 10pt; font-weight: bold;
+                color: #f8fafc;
+                font-size: 9.5pt;
+                font-weight: 600;
                 background: transparent;
             }
             QLabel#MeasurementDetailText {
-                color: #d0d0d0; font-size: 9pt; background: transparent;
+                color: #e2e8f0;
+                font-size: 9pt;
+                background: transparent;
             }
             QLabel#MeasurementLinkedLabel {
-                color: #78909c; font-size: 8pt; background: transparent;
+                color: #94a3b8;
+                font-size: 8.5pt;
+                background: transparent;
             }
         """
 
@@ -1901,7 +1326,10 @@ class ScanSectGUI(QMainWindow):
             QMainWindow { background-color: #000000; }
             QWidget { color: #ffffff; }
             QMenuBar, QMenu, QStatusBar { background-color: #000000; color: #ffffff; }
-            QTextEdit#MetadataPanel, QListWidget#MeasurementListWidget, QListWidget#ScreenshotListWidget, QListWidget#ArchiveList {
+            QTextEdit#MetadataPanel,
+            QListWidget#MeasurementListWidget,
+            QListWidget#ScreenshotListWidget,
+            QListWidget#ArchiveList {
                 background-color: #000000;
                 color: #ffffff;
                 border: 2px solid #ffffff;
@@ -1914,17 +1342,14 @@ class ScanSectGUI(QMainWindow):
             QPushButton:hover, QComboBox:hover, QLineEdit:focus, QListWidget:focus {
                 border: 2px solid #ffd400;
             }
-            QFrame#QuickActionsBar, QFrame#MeasurementDisplay, QFrame#MeasurementDetail {
+            QFrame#TopViewportBar, QFrame#ToolButtonContainer, QFrame#MeasurementDisplay, QFrame#MeasurementDetail {
                 background-color: #000000;
                 border: 2px solid #ffffff;
             }
             QLabel#MeasurementValue, QLabel#MeasurementTitle, QLabel#MeasurementModeBadge, QLabel#MeasurementStep,
-            QLabel#MeasurementCoords, QLabel#ArchiveTitle, QLabel#ToolGroupLabel, QLabel#EmptyStateLabel {
+            QLabel#MeasurementCoords, QLabel#ArchiveTitle, QLabel#ArchiveSubTitle, QLabel#ToolGroupLabel,
+            QLabel#EmptyStateLabel, QLabel#PreviewDialogInfo, QLabel#MeasurementLinkedLabel {
                 color: #ffffff;
-            }
-            QLabel#MeasurementModeBadge {
-                background-color: #000000;
-                border: 2px solid #ffd400;
             }
         """
 
@@ -1932,10 +1357,6 @@ class ScanSectGUI(QMainWindow):
             self.setStyleSheet(base_stylesheet + high_contrast_stylesheet)
         else:
             self.setStyleSheet(base_stylesheet)
-
-    # -----------------------------------------------------------------
-    # Event Filter
-    # -----------------------------------------------------------------
 
     def eventFilter(self, obj, event):
         if obj == self.plotter:
@@ -1950,8 +1371,7 @@ class ScanSectGUI(QMainWindow):
                 return True
 
             if self.is_measuring and event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
-                # Keep navigation active during measurement mode.
-                # Use Shift+LeftClick to pick locked measurement vertices.
+                # Hold Shift+LeftClick to pick vertices while keeping regular drag rotation active.
                 if event.modifiers() & Qt.ShiftModifier:
                     self._handle_measurement_click(event)
                     return True
@@ -1992,10 +1412,6 @@ class ScanSectGUI(QMainWindow):
                     self._active_remapped_button = Qt.NoButton
         return super().eventFilter(obj, event)
 
-    # -----------------------------------------------------------------
-    # Interaction Mode
-    # -----------------------------------------------------------------
-
     @Slot(QAbstractButton)
     def _on_interaction_mode_changed(self, button_clicked):
         mode_string = "rotate"
@@ -2004,14 +1420,8 @@ class ScanSectGUI(QMainWindow):
         elif button_clicked == self.zoom_button:
             mode_string = "zoom"
         self.custom_interactor_style.set_left_click_mode(mode_string)
-        if hasattr(self, 'ruler_widget'):
-            self.ruler_widget.SetEnabled(False)
         self.status_bar.showMessage(f"Left-Click Mode: {mode_string.capitalize()}")
         self.plotter.setFocus()
-
-    # -----------------------------------------------------------------
-    # Model Loading (Threaded)
-    # -----------------------------------------------------------------
 
     @Slot()
     def open_model_dialog(self):
@@ -2048,7 +1458,6 @@ class ScanSectGUI(QMainWindow):
             self.mesh_mgr.set_mesh(mesh, file_path)
             self.texture_button.setEnabled(True)
             self.clip_toggle_button.setEnabled(True)
-            # New session for each model load
             self._current_session_id = str(uuid.uuid4())[:8]
             self._clear_session_measurements()
 
@@ -2059,28 +1468,36 @@ class ScanSectGUI(QMainWindow):
             if self.is_measuring:
                 self._measurement_pick_points = []
                 self.current_measurement = {}
-                self._clear_session_measurements()
                 self._clear_measurement_visuals()
                 self.measurement_display.clear_display()
                 self.save_measurement_button.setEnabled(False)
                 self._update_measure_ui_hints()
             else:
-                self.status_bar.showMessage(f"Loaded: {self.mesh_mgr.model_basename}. Polys: {mesh.n_cells:,}. Mode: {mode}")
+                self.status_bar.showMessage(f"Loaded: {self.mesh_mgr.model_basename} ({mesh.n_cells:,} cells) | Mode: {mode}")
             texture_loaded = self.mesh_mgr.has_textures()
             self.metadata_panel.setText(self.mesh_mgr.get_metadata_text(texture_auto=texture_loaded))
             self._apply_measurement_filters()
             self._apply_screenshot_filters()
 
+            if self._pending_measurement_data is not None:
+                pending = self._pending_measurement_data
+                self._pending_measurement_data = None
+                self._apply_measurement_data_to_viewport(pending, switch_tab=True)
+
             if file_path.lower().endswith('.obj') and not texture_loaded:
-                QMessageBox.information(self, "No Texture Found",
+                QMessageBox.information(
+                    self,
+                    "No Texture Found",
                     "Could not find a texture file for this model.\n\n"
-                    "You can load a texture manually using the 'Load Texture' button.")
+                    "You can apply one manually with the Load Texture button.",
+                )
         except Exception as e:
             self.status_bar.showMessage(f"Error displaying model: {e}")
             QMessageBox.critical(self, "Model Display Error", f"Could not display model:\n{e}")
 
     @Slot(str, str)
     def _on_model_load_error(self, error_message, file_path):
+        self._pending_measurement_data = None
         self.loading_overlay.hide_overlay()
         self.status_bar.showMessage(f"Error loading model: {error_message}")
         QMessageBox.critical(self, "Model Load Error", f"Could not load model:\n{error_message}")
@@ -2090,22 +1507,21 @@ class ScanSectGUI(QMainWindow):
         self.clip_toggle_button.setChecked(False)
         self.clip_slider.setEnabled(False)
 
-    # -----------------------------------------------------------------
-    # Texture
-    # -----------------------------------------------------------------
-
     def apply_texture_to_current_model(self, texture_path):
         if not self.mesh_mgr.has_model:
             QMessageBox.warning(self, "No Model Loaded", "Please load a 3D model before applying a texture.")
             return
         self.status_bar.showMessage(f"Applying texture: {texture_path}...")
         try:
-            _ensure_3d_libs()
+            pv, _, _, _ = ensure_3d_libs()
             texture = pv.read_texture(texture_path)
             if not self.mesh_mgr.has_uvs():
-                reply = QMessageBox.question(self, "No UV Coordinates",
-                    "This model lacks UV coordinates. Generate basic UV mapping?",
-                    QMessageBox.Yes | QMessageBox.No)
+                reply = QMessageBox.question(
+                    self,
+                    "No UV Coordinates",
+                    "This model lacks UV coordinates. Generate planar UV mapping?",
+                    QMessageBox.Yes | QMessageBox.No,
+                )
                 if reply == QMessageBox.Yes:
                     try:
                         self.mesh_mgr.current_mesh.texture_map_to_plane(inplace=True)
@@ -2116,7 +1532,7 @@ class ScanSectGUI(QMainWindow):
                 self.plotter.remove_actor(self.mesh_mgr.current_actor)
             self.mesh_mgr.current_texture = texture
             self._apply_render_to_current_mesh(reset_camera=True)
-            self.status_bar.showMessage(f"Texture '{os.path.basename(texture_path)}' applied!")
+            self.status_bar.showMessage(f"Texture '{os.path.basename(texture_path)}' applied.")
             self.metadata_panel.setText(self.mesh_mgr.get_metadata_text(texture_manual=True))
         except Exception as e:
             self.status_bar.showMessage(f"Error applying texture: {e}")
@@ -2132,12 +1548,8 @@ class ScanSectGUI(QMainWindow):
         if texture_path:
             self.apply_texture_to_current_model(texture_path)
 
-    # -----------------------------------------------------------------
-    # Measurement
-    # -----------------------------------------------------------------
-
     def toggle_measurement_mode(self):
-        _ensure_3d_libs()
+        ensure_3d_libs()
         self.is_measuring = self.measure_button.isChecked()
 
         if self.is_measuring:
@@ -2152,12 +1564,6 @@ class ScanSectGUI(QMainWindow):
                 return
             try:
                 self._init_vertex_picker()
-
-                self.measurement_text_actor = vtk.vtkTextActor()
-                self.measurement_text_actor.GetTextProperty().SetFontSize(14)
-                self.measurement_text_actor.GetTextProperty().SetColor(0.31, 0.76, 0.97)
-                self.measurement_text_actor.SetPosition(10, 10)
-                self.plotter.renderer.AddActor(self.measurement_text_actor)
 
                 self._measurement_pick_points = []
                 self.current_measurement = {}
@@ -2181,9 +1587,6 @@ class ScanSectGUI(QMainWindow):
         self.plotter.render()
 
     def _cleanup_measurement_widgets(self):
-        if self.line_widget:
-            self.line_widget.SetEnabled(0)
-            self.line_widget = None
         self._clear_measurement_visuals()
         self._measurement_pick_points = []
         self.current_measurement = {}
@@ -2193,7 +1596,7 @@ class ScanSectGUI(QMainWindow):
             self.measurement_text_actor = None
 
     def _init_vertex_picker(self):
-        _ensure_3d_libs()
+        _, vtk, _, _ = ensure_3d_libs()
         if self._vertex_picker is None:
             self._vertex_picker = vtk.vtkPointPicker()
             self._vertex_picker.SetTolerance(0.01)
@@ -2221,7 +1624,7 @@ class ScanSectGUI(QMainWindow):
         mode = self.measurement_mode.lower()
         if mode == 'polyline':
             self.finish_measure_button.setEnabled(len(self._measurement_pick_points) >= 2)
-            self.status_bar.showMessage(f"Polyline points: {len(self._measurement_pick_points)}. Click Finish when done.")
+            self.status_bar.showMessage(f"Polyline points: {len(self._measurement_pick_points)}. Click Finish Path when done.")
             self.measurement_display.update_context(self.measurement_mode, self._measurement_step_text())
             self._position_measurement_display()
             return
@@ -2254,6 +1657,12 @@ class ScanSectGUI(QMainWindow):
         if point_id < 0:
             return None
 
+        mapper = self.mesh_mgr.current_actor.GetMapper()
+        dataset = mapper.GetInput() if mapper is not None else None
+        if dataset is not None and point_id < dataset.GetNumberOfPoints():
+            p = dataset.GetPoint(point_id)
+            return [float(p[0]), float(p[1]), float(p[2])]
+
         points = self.mesh_mgr.current_mesh.points
         if point_id >= len(points):
             return None
@@ -2262,6 +1671,7 @@ class ScanSectGUI(QMainWindow):
         return [float(p[0]), float(p[1]), float(p[2])]
 
     def _draw_measurement_visuals(self):
+        _, vtk, np, _ = ensure_3d_libs()
         self._clear_measurement_visuals()
         if not self._measurement_pick_points:
             self.plotter.render()
@@ -2276,7 +1686,7 @@ class ScanSectGUI(QMainWindow):
             diag = max(np.sqrt(dx * dx + dy * dy + dz * dz), 1e-6)
             radius = max(diag * 0.005, 0.05)
 
-        marker_colors = [(1.0, 0.8, 0.2), (0.31, 0.76, 0.97)]
+        marker_colors = [(0.96, 0.62, 0.04), (0.01, 0.52, 0.78)]
         for idx, point in enumerate(self._measurement_pick_points):
             sphere = vtk.vtkSphereSource()
             sphere.SetCenter(point[0], point[1], point[2])
@@ -2308,7 +1718,7 @@ class ScanSectGUI(QMainWindow):
 
                 line_actor = vtk.vtkActor()
                 line_actor.SetMapper(mapper)
-                line_actor.GetProperty().SetColor(0.31, 0.76, 0.97)
+                line_actor.GetProperty().SetColor(0.01, 0.52, 0.78)
                 line_actor.GetProperty().SetLineWidth(3.0)
 
                 self.plotter.renderer.AddActor(line_actor)
@@ -2344,10 +1754,9 @@ class ScanSectGUI(QMainWindow):
                 'angle_degrees': angle_value,
                 'distance_value_mm': 0.0,
             }
-            text = f"Angle: {angle_value:.2f} deg"
-            self.measurement_text_actor.SetInput(text)
-            self.status_bar.showMessage(text)
-            self.measurement_display.update_measurement(points[0], points[2], text)
+            value_text = f"{angle_value:.2f} deg"
+            self.status_bar.showMessage(f"Angle: {value_text}")
+            self.measurement_display.update_measurement(points[0], points[2], value_text)
             self._position_measurement_display()
             self.plotter.render()
         else:
@@ -2362,10 +1771,9 @@ class ScanSectGUI(QMainWindow):
                 'distance': polyline_raw(points),
                 'distance_value_mm': total_mm,
             }
-            text = f"Polyline: {self._format_distance_from_mm(total_mm, decimals=2)}"
-            self.measurement_text_actor.SetInput(text)
-            self.status_bar.showMessage(text)
-            self.measurement_display.update_measurement(points[0], points[-1], text)
+            value_text = self._format_distance_from_mm(total_mm, decimals=2)
+            self.status_bar.showMessage(f"Polyline ({len(points)} pts): {value_text}")
+            self.measurement_display.update_measurement(points[0], points[-1], value_text)
             self._position_measurement_display()
             self.plotter.render()
 
@@ -2378,7 +1786,7 @@ class ScanSectGUI(QMainWindow):
     def _update_measurement(self, point1, point2):
         if not self.is_measuring or point1 is None or point2 is None:
             return
-        _ensure_3d_libs()
+        ensure_3d_libs()
         raw_len = distance_raw(point1, point2)
         value_mm = distance_mm(point1, point2, self.scale_to_mm)
 
@@ -2393,26 +1801,16 @@ class ScanSectGUI(QMainWindow):
         }
 
         measurement_text = f"Distance: {self._format_distance_from_mm(value_mm, decimals=2)}"
-        self.measurement_text_actor.SetInput(measurement_text)
         self.status_bar.showMessage(measurement_text)
 
-        # Update the styled measurement overlay
         self.measurement_display.update_measurement(point1, point2, self._format_distance_from_mm(value_mm, decimals=4))
         self._position_measurement_display()
 
         self.plotter.render()
 
     def _position_measurement_display(self):
-        """Anchor measurement display at bottom-left of viewport container."""
-        container = self._viewport_container
-        cw = container.width()
-        dw = min(380, cw - 20)
-        dh = self.measurement_display.sizeHint().height()
-        self.measurement_display.setGeometry(10, container.height() - dh - 10, dw, dh)
-
-    # -----------------------------------------------------------------
-    # Screenshot / Save
-    # -----------------------------------------------------------------
+        """MeasurementDisplayWidget is managed directly by left_layout outside the OpenGL surface."""
+        self.measurement_display.update()
 
     def create_thumbnail(self, image_path, thumbnail_size=(100, 100)):
         try:
@@ -2427,8 +1825,12 @@ class ScanSectGUI(QMainWindow):
             pixmap = QPixmap(image_path)
             if pixmap.isNull():
                 return None
-            thumb = pixmap.scaled(thumbnail_size[0], thumbnail_size[1],
-                                  Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            thumb = pixmap.scaled(
+                thumbnail_size[0],
+                thumbnail_size[1],
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
 
             if len(self._thumbnail_cache) > 500:
                 self._thumbnail_cache.clear()
@@ -2447,8 +1849,10 @@ class ScanSectGUI(QMainWindow):
     def capture_model_thumbnail(self, save_path=None):
         try:
             if save_path is None:
-                save_path = os.path.join(self.archive_mgr.screenshots_dir,
-                                         f"thumb_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+                save_path = os.path.join(
+                    self.archive_mgr.screenshots_dir,
+                    f"thumb_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:19]}.png",
+                )
             self.plotter.screenshot(save_path, transparent_background=False, window_size=[400, 400])
             return save_path
         except Exception as e:
@@ -2465,7 +1869,7 @@ class ScanSectGUI(QMainWindow):
             return
 
         folder = self.archive_mgr.get_screenshot_path(self.mesh_mgr.insect_name)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
         filename = f"screenshot_{timestamp}.png"
         file_path = os.path.join(folder, filename)
         thumb_path = os.path.join(folder, f"thumb_{timestamp}.png")
@@ -2502,7 +1906,7 @@ class ScanSectGUI(QMainWindow):
             return
 
         folder = self.archive_mgr.get_measurement_path(self.mesh_mgr.insect_name)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
         filename = f"measurement_{timestamp}.txt"
         file_path = os.path.join(folder, filename)
         thumb_path = os.path.join(folder, f"thumb_{timestamp}.png")
@@ -2518,7 +1922,7 @@ class ScanSectGUI(QMainWindow):
             distance_raw_value = float(m.get('distance', polyline_raw(points) if len(points) >= 2 else 0.0))
             distance_mm_value = float(m.get('distance_value_mm', m.get('distance_mm', distance_raw_value * self.scale_to_mm)))
             display_value = self._measurement_display_text(m)
-            with open(file_path, 'w') as f:
+            with open(file_path, 'w', encoding='utf-8') as f:
                 f.write("ScanSect Measurement Data\n")
                 f.write("========================\n\n")
                 f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -2569,32 +1973,28 @@ class ScanSectGUI(QMainWindow):
         dialog.setWindowTitle(f"Save {item_type}")
         dialog.setMinimumWidth(400)
         layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel(f"Enter a description for this {item_type.lower()}:"))
+        layout.addWidget(QLabel(f"Enter a note or label for this {item_type.lower()}:"))
         description_edit = QLineEdit()
-        description_edit.setPlaceholderText("E.g., Wing span measurement, Top view, etc.")
+        description_edit.setPlaceholderText("e.g., Wing span, dorsal thorax view")
         layout.addWidget(description_edit)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
         if dialog.exec() == QDialog.Accepted:
-            return description_edit.text() or f"{item_type} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", True
+            return description_edit.text() or f"{item_type} ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})", True
         return None, False
 
-    # -----------------------------------------------------------------
-    # Measurement Module (independent data access)
-    # -----------------------------------------------------------------
-
     def _refresh_measurement_list(self):
-        self.measurement_list.clear()
-        self.archive_mgr.measurements = self.archive_mgr._load_index(self.archive_mgr.measurements_index)
-
-        # Update insect filter
         current = self.meas_insect_filter.currentText()
         self.meas_insect_filter.blockSignals(True)
         self.meas_insect_filter.clear()
         self.meas_insect_filter.addItem("All Insects")
-        names = set(m.get('model_name', 'Unknown') for m in self.archive_mgr.measurements if m.get('model_name') != 'Unknown')
+        names = set(
+            m.get('model_name', 'Unknown')
+            for m in self.archive_mgr.measurements
+            if m.get('model_name') != 'Unknown'
+        )
         for n in sorted(names):
             self.meas_insect_filter.addItem(n)
         idx = self.meas_insect_filter.findText(current)
@@ -2612,7 +2012,6 @@ class ScanSectGUI(QMainWindow):
 
         items = list(self.archive_mgr.measurements)
 
-        # Filter
         if insect != "All Insects":
             items = [m for m in items if m.get('model_name') == insect]
 
@@ -2623,11 +2022,10 @@ class ScanSectGUI(QMainWindow):
         if self.meas_current_session_only_chk.isChecked():
             items = [m for m in items if m.get('session_id') == self._current_session_id]
 
-        # Sort
         if sort_mode == "Newest First":
             items = list(reversed(items))
         elif sort_mode == "Oldest First":
-            pass  # already chronological
+            pass
         elif sort_mode.startswith("Distance"):
             reverse = "\u2193" in sort_mode
             items.sort(key=lambda m: self._measurement_entry_mm(m), reverse=reverse)
@@ -2666,19 +2064,14 @@ class ScanSectGUI(QMainWindow):
             ts = item.get('timestamp', '?')
             model = item.get('model_name', '?')
             sid = item.get('session_id', '')[:6]
-            m_type = str(item.get('measurement_type', 'distance')).lower()
-            type_chip = {
-                'distance': '[DIST]',
-                'angle': '[ANGLE]',
-                'polyline': '[PATH]',
-            }.get(m_type, '[MEAS]')
-            display = f"{type_chip} {dist}\n{desc}\n{model}  \u2022  {ts}  [{sid}]"
+            m_type = str(item.get('measurement_type', 'distance')).capitalize()
+            display = f"{dist}  ({m_type})\n{desc}\n{model}  |  {ts}  [{sid}]"
             li = QListWidgetItem(display)
             li.setData(Qt.UserRole, item)
 
             thumb_path = item.get('thumbnail_path')
             if thumb_path and os.path.exists(thumb_path):
-                thumb = self.create_thumbnail(thumb_path, (60, 60))
+                thumb = self.create_thumbnail(thumb_path, (56, 56))
                 if thumb:
                     li.setIcon(QIcon(thumb))
 
@@ -2709,7 +2102,48 @@ class ScanSectGUI(QMainWindow):
         if data and 'file_path' in data:
             fp = data['file_path']
             if os.path.exists(fp):
-                os.startfile(fp)
+                QDesktopServices.openUrl(QUrl.fromLocalFile(fp))
+
+    def _apply_measurement_data_to_viewport(self, data, switch_tab=True):
+        if not data:
+            return False
+        points = data.get('points')
+        if not points:
+            p1 = data.get('point1')
+            p2 = data.get('point2')
+            p3 = data.get('point3')
+            points = [p for p in [p1, p2, p3] if p is not None]
+        if len(points) < 2:
+            QMessageBox.warning(self, "Incomplete Data", "This measurement doesn't have enough position points.")
+            return False
+        try:
+            if not self.is_measuring:
+                self.measure_button.setChecked(True)
+                self.toggle_measurement_mode()
+            if not self.is_measuring:
+                return False
+
+            self._restore_measurement_scale_and_unit(data)
+            m_type = str(data.get('measurement_type', 'distance')).capitalize()
+            self.measurement_mode = m_type if m_type in ["Distance", "Angle", "Polyline"] else "Distance"
+            self.measure_mode_combo.blockSignals(True)
+            self.measure_mode_combo.setCurrentText(self.measurement_mode)
+            self.measure_mode_combo.blockSignals(False)
+
+            self._measurement_pick_points = [[float(v) for v in p] for p in points]
+            self._draw_measurement_visuals()
+            self._finalize_measurement_from_points(record_history=False)
+            self.save_measurement_button.setEnabled(True)
+            self._update_measure_ui_hints()
+            desc = data.get('description', 'Loaded')
+            dist = self._measurement_display_text(self.current_measurement or data)
+            self.status_bar.showMessage(f"Loaded measurement: {desc} ({dist})")
+            if switch_tab:
+                self.right_panel_tabs.setCurrentIndex(0)
+            return True
+        except Exception as e:
+            QMessageBox.critical(self, "Load Error", f"Could not load measurement:\n{e}")
+            return False
 
     def _load_measurement_from_module(self):
         selected = self.measurement_list.selectedItems()
@@ -2732,36 +2166,20 @@ class ScanSectGUI(QMainWindow):
             return
         if not self.mesh_mgr.has_model:
             if 'model_path' in data and os.path.exists(data['model_path']):
-                reply = QMessageBox.question(self, "Load Model?",
+                reply = QMessageBox.question(
+                    self,
+                    "Load Model?",
                     f"Load the associated model?\nModel: {data.get('model_name', 'Unknown')}",
-                    QMessageBox.Yes | QMessageBox.No)
+                    QMessageBox.Yes | QMessageBox.No,
+                )
                 if reply == QMessageBox.Yes:
+                    self._pending_measurement_data = data
                     self.load_model(data['model_path'])
                 return
             else:
                 QMessageBox.warning(self, "No Model", "Please load the associated 3D model first.")
                 return
-        try:
-            if not self.is_measuring:
-                self.measure_button.setChecked(True)
-                self.toggle_measurement_mode()
-            if self.is_measuring:
-                m_type = str(data.get('measurement_type', 'distance')).capitalize()
-                self.measurement_mode = m_type if m_type in ["Distance", "Angle", "Polyline"] else "Distance"
-                self.measure_mode_combo.blockSignals(True)
-                self.measure_mode_combo.setCurrentText(self.measurement_mode)
-                self.measure_mode_combo.blockSignals(False)
-
-                self._measurement_pick_points = [[float(v) for v in p] for p in points]
-                self._draw_measurement_visuals()
-                self._finalize_measurement_from_points(record_history=False)
-                self.save_measurement_button.setEnabled(True)
-                desc = data.get('description', 'Loaded')
-                dist = self._measurement_display_text(data)
-                self.status_bar.showMessage(f"Loaded measurement: {desc} ({dist})")
-                self.right_panel_tabs.setCurrentIndex(0)
-        except Exception as e:
-            QMessageBox.critical(self, "Load Error", f"Could not load measurement:\n{e}")
+        self._apply_measurement_data_to_viewport(data, switch_tab=True)
 
     def _rename_measurement(self):
         selected = self.measurement_list.selectedItems()
@@ -2774,41 +2192,46 @@ class ScanSectGUI(QMainWindow):
             self.archive_mgr.save_measurements()
             self._refresh_measurement_list()
 
+    def _delete_entry_files(self, data):
+        if not data:
+            return
+        for key in ('file_path', 'thumbnail_path'):
+            fp = data.get(key)
+            if fp and os.path.exists(fp):
+                try:
+                    os.remove(fp)
+                except Exception:
+                    pass
+            self._invalidate_thumbnail_cache_for_path(fp)
+
     def _delete_measurement(self):
         selected = self.measurement_list.selectedItems()
         if not selected:
             return
-        reply = QMessageBox.question(self, "Confirm Delete",
-            f"Delete {len(selected)} measurement(s)?", QMessageBox.Yes | QMessageBox.No)
+        reply = QMessageBox.question(
+            self,
+            "Confirm Delete",
+            f"Delete {len(selected)} measurement(s)?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
         if reply != QMessageBox.Yes:
             return
         for item in selected:
             data = item.data(Qt.UserRole)
-            if data and 'file_path' in data:
-                fp = data['file_path']
-                if os.path.exists(fp):
-                    try:
-                        os.remove(fp)
-                    except Exception:
-                        pass
-            self._invalidate_thumbnail_cache_for_path(data.get('thumbnail_path'))
-            self._invalidate_thumbnail_cache_for_path(data.get('file_path'))
+            self._delete_entry_files(data)
             self.archive_mgr.remove_measurement(data)
         self._refresh_measurement_list()
 
-    # -----------------------------------------------------------------
-    # Screenshot Module (independent data access)
-    # -----------------------------------------------------------------
-
     def _refresh_screenshot_list(self):
-        self.screenshot_list.clear()
-        self.archive_mgr.screenshots = self.archive_mgr._load_index(self.archive_mgr.screenshots_index)
-
         current = self.ss_insect_filter.currentText()
         self.ss_insect_filter.blockSignals(True)
         self.ss_insect_filter.clear()
         self.ss_insect_filter.addItem("All Insects")
-        names = set(s.get('model_name', 'Unknown') for s in self.archive_mgr.screenshots if s.get('model_name') != 'Unknown')
+        names = set(
+            s.get('model_name', 'Unknown')
+            for s in self.archive_mgr.screenshots
+            if s.get('model_name') != 'Unknown'
+        )
         for n in sorted(names):
             self.ss_insect_filter.addItem(n)
         idx = self.ss_insect_filter.findText(current)
@@ -2852,20 +2275,19 @@ class ScanSectGUI(QMainWindow):
             ts = item.get('timestamp', '?')
             model = item.get('model_name', '?')
             sid = item.get('session_id', '')[:6]
-            display = f"[SHOT] {desc}\n{model}  \u2022  {ts}  [{sid}]"
+            display = f"{desc}\n{model}  |  {ts}  [{sid}]"
             li = QListWidgetItem(display)
             li.setData(Qt.UserRole, item)
 
-            # Thumbnail
             thumb_path = item.get('thumbnail_path')
             if thumb_path and os.path.exists(thumb_path):
-                thumb = self.create_thumbnail(thumb_path, (100, 100))
+                thumb = self.create_thumbnail(thumb_path, (88, 88))
                 if thumb:
                     li.setIcon(QIcon(thumb))
             else:
                 fp = item.get('file_path')
                 if fp and os.path.exists(fp) and fp.lower().endswith(('.png', '.jpg', '.jpeg')):
-                    thumb = self.create_thumbnail(fp, (100, 100))
+                    thumb = self.create_thumbnail(fp, (88, 88))
                     if thumb:
                         li.setIcon(QIcon(thumb))
 
@@ -2911,27 +2333,19 @@ class ScanSectGUI(QMainWindow):
         selected = self.screenshot_list.selectedItems()
         if not selected:
             return
-        reply = QMessageBox.question(self, "Confirm Delete",
-            f"Delete {len(selected)} screenshot(s)?", QMessageBox.Yes | QMessageBox.No)
+        reply = QMessageBox.question(
+            self,
+            "Confirm Delete",
+            f"Delete {len(selected)} screenshot(s)?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
         if reply != QMessageBox.Yes:
             return
         for item in selected:
             data = item.data(Qt.UserRole)
-            if data and 'file_path' in data:
-                fp = data['file_path']
-                if os.path.exists(fp):
-                    try:
-                        os.remove(fp)
-                    except Exception:
-                        pass
-            self._invalidate_thumbnail_cache_for_path(data.get('thumbnail_path'))
-            self._invalidate_thumbnail_cache_for_path(data.get('file_path'))
+            self._delete_entry_files(data)
             self.archive_mgr.remove_screenshot(data)
         self._refresh_screenshot_list()
-
-    # -----------------------------------------------------------------
-    # Shared Helpers
-    # -----------------------------------------------------------------
 
     def _get_rename_input(self, data):
         if not data:
@@ -2958,29 +2372,12 @@ class ScanSectGUI(QMainWindow):
 
     def _open_folder(self, path):
         if os.path.exists(path):
-            os.startfile(path)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
         else:
             QMessageBox.warning(self, "Folder Not Found", f"Folder does not exist:\n{path}")
 
-    # -----------------------------------------------------------------
-    # Recent Models
-    # -----------------------------------------------------------------
-
     def _load_recent_models(self):
-        if os.path.exists(self.recent_models_file):
-            try:
-                with open(self.recent_models_file, 'r') as f:
-                    return json.load(f)
-            except Exception:
-                backup_path = f"{self.recent_models_file}.bak"
-                if os.path.exists(backup_path):
-                    try:
-                        with open(backup_path, 'r') as f:
-                            return json.load(f)
-                    except Exception:
-                        pass
-                return []
-        return []
+        return load_json_with_backup(self.recent_models_file, [])
 
     def _save_recent_models(self):
         try:
@@ -3004,14 +2401,24 @@ class ScanSectGUI(QMainWindow):
         self._save_recent_models()
         self._refresh_recent_models_list()
 
+    def _format_short_directory(self, directory):
+        if not directory:
+            return ""
+        parts = os.path.normpath(directory).replace("\\", "/").split("/")
+        if len(parts) <= 3:
+            return "/".join(parts)
+        return f"{parts[0]}/.../{'/'.join(parts[-2:])}"
+
     def _refresh_recent_models_list(self):
         self.recent_models_list.clear()
         for model in self.recent_models:
-            if not os.path.exists(model.get('path', '')):
+            full_path = model.get('path', '')
+            if not os.path.exists(full_path):
                 continue
             name = model.get('name', 'Unknown')
             last_accessed = model.get('last_accessed', 'Unknown')
             directory = model.get('directory', '')
+            short_dir = self._format_short_directory(directory)
             size = model.get('size', 0)
             if size < 1024:
                 size_str = f"{size} B"
@@ -3019,8 +2426,9 @@ class ScanSectGUI(QMainWindow):
                 size_str = f"{size / 1024:.1f} KB"
             else:
                 size_str = f"{size / (1024 * 1024):.1f} MB"
-            display = f"{name}\n  {size_str} \u2022 {last_accessed}\n  {directory}"
+            display = f"{name}\n{size_str}  |  {last_accessed}\n{short_dir}"
             li = QListWidgetItem(display)
+            li.setToolTip(full_path)
             li.setData(Qt.UserRole, model)
             self.recent_models_list.addItem(li)
 
@@ -3054,16 +2462,16 @@ class ScanSectGUI(QMainWindow):
     def _clear_recent_models(self):
         if not self.recent_models:
             return
-        reply = QMessageBox.question(self, "Clear Recent Models",
-            "Clear all recent models?", QMessageBox.Yes | QMessageBox.No)
+        reply = QMessageBox.question(
+            self,
+            "Clear Recent Models",
+            "Clear all recent models?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
         if reply == QMessageBox.Yes:
             self.recent_models = []
             self._save_recent_models()
             self._refresh_recent_models_list()
-
-    # -----------------------------------------------------------------
-    # Cleanup / Resize
-    # -----------------------------------------------------------------
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -3076,35 +2484,28 @@ class ScanSectGUI(QMainWindow):
         if self._loader_worker and self._loader_worker.isRunning():
             self._loader_worker.quit()
             self._loader_worker.wait(2000)
-        if self._save_worker and self._save_worker.isRunning():
-            self._save_worker.quit()
-            self._save_worker.wait(2000)
         self._cleanup_measurement_widgets()
         if hasattr(self, 'plotter') and self.plotter is not None:
             self.plotter.close()
         super().closeEvent(event)
 
 
-# =====================================================================
-# Entry Point
-# =====================================================================
-
 def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
 
-    splash_pix = QPixmap(480, 280)
-    splash_pix.fill(QColor("#1e1e1e"))
+    splash_pix = QPixmap(480, 260)
+    splash_pix.fill(QColor("#16181d"))
     painter = QPainter(splash_pix)
-    painter.setPen(QColor("#007acc"))
-    font = QFont("Segoe UI", 28, QFont.Bold)
+    painter.setPen(QColor("#38bdf8"))
+    font = QFont("Segoe UI", 26, QFont.Bold)
     painter.setFont(font)
-    painter.drawText(splash_pix.rect(), Qt.AlignCenter, "ScanSect")
-    painter.setPen(QColor("#888888"))
-    font.setPointSize(11)
+    painter.drawText(splash_pix.rect().adjusted(0, -14, 0, -14), Qt.AlignCenter, "ScanSect")
+    painter.setPen(QColor("#94a3b8"))
+    font.setPointSize(10)
     font.setBold(False)
     painter.setFont(font)
-    painter.drawText(splash_pix.rect().adjusted(0, 60, 0, 0), Qt.AlignCenter, "Loading 3D libraries...")
+    painter.drawText(splash_pix.rect().adjusted(0, 48, 0, 0), Qt.AlignCenter, "3D Entomology Specimen & Morphometrics Viewer")
     painter.end()
 
     splash = QSplashScreen(splash_pix)

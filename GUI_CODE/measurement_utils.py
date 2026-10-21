@@ -1,8 +1,11 @@
+import json
 import math
+import os
+import shutil
 
 
 def distance_raw(point1, point2):
-    return math.sqrt(sum((b - a) ** 2 for a, b in zip(point1, point2)))
+    return math.dist(point1, point2)
 
 
 def distance_mm(point1, point2, scale_to_mm=1.0):
@@ -48,3 +51,41 @@ def unit_multiplier_from_mm(unit_name):
 def format_distance_from_mm(value_mm, unit_name="mm", decimals=2):
     converted = float(value_mm) * unit_multiplier_from_mm(unit_name)
     return f"{converted:.{decimals}f} {unit_name}"
+
+
+def atomic_write_json_with_backup(file_path, data):
+    """Write JSON atomically and keep a .bak snapshot of the previous file."""
+    directory = os.path.dirname(file_path) or "."
+    os.makedirs(directory, exist_ok=True)
+    temp_path = f"{file_path}.tmp"
+    backup_path = f"{file_path}.bak"
+
+    try:
+        if os.path.exists(file_path):
+            shutil.copy2(file_path, backup_path)
+
+        with open(temp_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+
+        os.replace(temp_path, file_path)
+    except Exception:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+        raise
+
+
+def load_json_with_backup(file_path, default=None):
+    """Load JSON from file_path, falling back to file_path.bak if corrupted."""
+    if default is None:
+        default = []
+    for candidate in (file_path, f"{file_path}.bak"):
+        if os.path.exists(candidate):
+            try:
+                with open(candidate, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception:
+                continue
+    return default
