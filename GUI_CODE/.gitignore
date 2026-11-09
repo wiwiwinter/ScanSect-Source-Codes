@@ -1,9 +1,0 @@
-__pycache__/
-*.py[cod]
-*.bak
-*.tmp
-.venv/
-recent_models.json
-BACKUP/
-ScanSect_Archive/
-
