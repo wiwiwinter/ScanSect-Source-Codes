@@ -7,9 +7,11 @@ Thesis project: scan insect specimens with a turntable and camera, then inspect 
 | Folder | What it is |
 |--------|-----------|
 | `GUI_CODE/` | PySide6 + PyVista viewer for 3D models, screenshots and measurements. See [GUI_CODE/README.md](GUI_CODE/README.md). |
-| `TURN_TABLE_CODE.ino/` | Arduino sketch that drives the turntable and sends `CAPTURE` over serial after each step. |
-| `SCRIPT-CAMERA-SHUTTER-CLICK/` | `CAPTURE.py` listens for `CAPTURE` on serial and fires the camera with `gphoto2`. `CAPTURE_DEBUG.py` is the verbose version. |
+| `TURN_TABLE_CODE.ino/` | Arduino sketch that turns the table 5° at a time and sends `READY` over serial, then waits for `DONE`. |
+| `SCRIPT-CAMERA-SHUTTER-CLICK/` | Scripts that read the serial signal and fire the camera with `gphoto2`. `CAPTURE_DEBUG.py` matches the sketch; `CAPTURE.py` is older. |
 | `SCRIPT-BATCH-COPY-AND-PASTE/` | `SCRIPT.py` moves images from the camera dump folder to the Lightroom watch folder (edit the two paths at the top). |
+
+**Want to build it yourself? Follow [GUIDE.md](GUIDE.md).**
 
 ## Workflow
 
